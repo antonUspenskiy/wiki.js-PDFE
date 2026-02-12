@@ -1,0 +1,26 @@
+{
+  "name": "page-to-pdf-exporter",
+  "version": "1.0.0",
+  "description": "Export any page URL (Wiki.js compatible) to PDF with full styling",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "export": "node Export.js",
+    "export-all": "node export-all.js",
+    "cleanup": "node cleanup.js",
+    "cleanup-modules": "node cleanup-node-modules.js",
+    "setup-linux": "chmod +x setup.sh && ./setup.sh",
+    "start-linux": "chmod +x start.sh && ./start.sh",
+    "setup-auto": "chmod +x setup-auto.sh && ./setup-auto.sh",
+    "test-setup": "chmod +x test-setup.sh && ./test-setup.sh"
+  },
+  "dependencies": {
+    "puppeteer-core": "^22.8.2",
+    "yargs": "^17.7.2",
+    "electron": "^29.1.0",
+    "axios": "^1.7.7",
+    "marked": "^12.0.2",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^4.6.82"
+  }
+}

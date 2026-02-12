@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>PDFE v_1.96s</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 20px auto;
+            padding: 0 20px;
+            background-color: #f5f5f5;
+        }
+        .container {
+            background-color: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input[type="text"],
+        input[type="password"],
+        input[type="email"] {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box;
+        }
+        .directory-group {
+            display: flex;
+            gap: 10px;
+        }
+        .directory-group input {
+            flex: 1;
+        }
+        .directory-group button {
+            flex-shrink: 0;
+            margin: 0;
+            background-color: #607d8b;
+        }
+        .directory-group button:hover {
+            background-color: #546e7a;
+        }
+        button {
+            background-color: #4CAF50;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        #status {
+            margin-top: 20px;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .success {
+            background-color: #dff0d8;
+            color: #3c763d;
+        }
+        .error {
+            background-color: #f2dede;
+            color: #a94442;
+        }
+        #exportProgress {
+            margin-top: 20px;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>PDFE v_1.96s</h1>
+
+        <h2>Single page (login)</h2>
+        <form id="configForm">
+            <div class="form-group">
+                <label for="pageUrl">Page URL:</label>
+                <input type="text" id="pageUrl" placeholder="https://your-wiki.example.com/path/to/page" required>
+            </div>
+            <div class="form-group">
+                <label for="email">Email:</label>
+                <input type="email" id="email" required>
+            </div>
+            <div class="form-group">
+                <label for="password">Password:</label>
+                <input type="password" id="password" required>
+            </div>
+            <div class="form-group">
+                <label for="outputDir">Output Directory:</label>
+                <div class="directory-group">
+                    <input type="text" id="outputDir" required>
+                    <button type="button" id="selectDir">Browse...</button>
+                </div>
+            </div>
+            <button type="submit">Save & Export single page</button>
+            <button type="button" id="loadConfig">Load Config</button>
+        </form>
+
+        <hr />
+
+        <h2>Export all pages (API key)</h2>
+        <form id="exportAllForm">
+            <div class="form-group">
+                <label for="baseUrlAll">Base URL:</label>
+                <input type="text" id="baseUrlAll" placeholder="https://your-wiki.example.com" required>
+            </div>
+            <div class="form-group">
+                <label for="apiKey">Wiki.js API key:</label>
+                <input type="text" id="apiKey" required>
+            </div>
+            <div class="form-group">
+                <label for="outputDirAll">Output Directory for all PDFs:</label>
+                <div class="directory-group">
+                    <input type="text" id="outputDirAll" required>
+                    <button type="button" id="selectDirAll">Browse...</button>
+                </div>
+            </div>
+            <button type="submit">Save & Export all</button>
+        </form>
+
+        <div id="status"></div>
+        <div id="exportProgress"></div>
+    </div>
+    <script>
+        const { ipcRenderer } = require('electron');
+        const fs = require('fs');
+
+        const form = document.getElementById('configForm');
+        const exportAllForm = document.getElementById('exportAllForm');
+        const status = document.getElementById('status');
+        const progress = document.getElementById('exportProgress');
+        const loadConfigBtn = document.getElementById('loadConfig');
+        const selectDirBtn = document.getElementById('selectDir');
+        const outputDirInput = document.getElementById('outputDir');
+        const pageUrlInput = document.getElementById('pageUrl');
+
+        // Directory selection
+        selectDirBtn.addEventListener('click', async () => {
+            const directory = await ipcRenderer.invoke('select-directory');
+            if (directory) {
+                outputDirInput.value = directory;
+            }
+        });
+
+        // Load existing configuration (button and on startup)
+        function loadConfigFromDisk() {
+            try {
+                const config = JSON.parse(fs.readFileSync('config.json'));
+                const composedUrl = config.pageUrl
+                    || (config.baseUrl && config.articlePath ? `${config.baseUrl}${config.articlePath}` : '');
+                pageUrlInput.value = composedUrl || '';
+                document.getElementById('email').value = config.credentials?.email || '';
+                document.getElementById('password').value = config.credentials?.password || '';
+                document.getElementById('outputDir').value = config.outputDir || '';
+                // Fill export-all fields if present
+                document.getElementById('baseUrlAll').value = config.baseUrl || '';
+                document.getElementById('apiKey').value = config.apiKey || '';
+                document.getElementById('outputDirAll').value = config.outputDir || '';
+                showStatus('Configuration loaded', 'success');
+            } catch (error) {
+                showStatus('No existing configuration found', 'error');
+            }
+        }
+        loadConfigBtn.addEventListener('click', loadConfigFromDisk);
+        // Auto-load on startup to remember credentials/last URL
+        loadConfigFromDisk();
+
+        // Handle form submission
+        form.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const enteredUrl = pageUrlInput.value.trim();
+            let baseUrl = '';
+            let articlePath = '';
+            try {
+                const u = new URL(enteredUrl);
+                baseUrl = u.origin;
+                articlePath = u.pathname + (u.search || '');
+            } catch (err) {
+                showStatus('Invalid Page URL', 'error');
+                return;
+            }
+
+            const existingConfig = (() => {
+                try {
+                    return JSON.parse(fs.readFileSync('config.json'));
+                } catch (_) {
+                    return {};
+                }
+            })();
+            const config = {
+                ...existingConfig,
+                pageUrl: enteredUrl,
+                baseUrl: baseUrl,
+                loginPath: '/login',
+                articlePath: articlePath,
+                credentials: {
+                    ...(existingConfig.credentials || {}),
+                    email: document.getElementById('email').value,
+                    password: document.getElementById('password').value
+                },
+                outputDir: document.getElementById('outputDir').value,
+                timeout: 30000
+            };
+
+            // Save configuration
+            ipcRenderer.send('save-config', config);
+            
+            // Start export process
+            progress.innerHTML = 'Starting export process...\n';
+            ipcRenderer.send('start-export');
+        });
+
+        // Export-all form submission
+        const selectDirAllBtn = document.getElementById('selectDirAll');
+        const outputDirAllInput = document.getElementById('outputDirAll');
+
+        selectDirAllBtn.addEventListener('click', async () => {
+            const directory = await ipcRenderer.invoke('select-directory');
+            if (directory) {
+                outputDirAllInput.value = directory;
+            }
+        });
+
+        exportAllForm.addEventListener('submit', (e) => {
+            e.preventDefault();
+
+            const baseUrl = document.getElementById('baseUrlAll').value.trim();
+            const apiKey = document.getElementById('apiKey').value.trim();
+            const outputDirAll = outputDirAllInput.value.trim();
+
+            if (!baseUrl || !apiKey || !outputDirAll) {
+                showStatus('Please fill Base URL, API key and Output directory for export-all', 'error');
+                return;
+            }
+
+            const existingConfig = (() => {
+                try {
+                    return JSON.parse(fs.readFileSync('config.json'));
+                } catch (_) {
+                    return {};
+                }
+            })();
+            const config = {
+                ...existingConfig,
+                baseUrl: baseUrl,
+                apiKey: apiKey,
+                outputDir: outputDirAll,
+                timeout: 30000
+            };
+
+            // Save configuration
+            ipcRenderer.send('save-config', config);
+
+            // Start export-all process
+            progress.innerHTML = 'Starting export-all process...\n';
+            ipcRenderer.send('start-export-all');
+        });
+
+        // Handle responses
+        ipcRenderer.on('config-saved', () => {
+            showStatus('Configuration saved successfully', 'success');
+        });
+
+        ipcRenderer.on('export-progress', (event, message) => {
+            progress.innerHTML += message + '\n';
+            progress.scrollTop = progress.scrollHeight;
+        });
+
+        ipcRenderer.on('export-error', (event, message) => {
+            progress.innerHTML += `Error: ${message}\n`;
+            progress.scrollTop = progress.scrollHeight;
+        });
+
+        ipcRenderer.on('export-complete', (event, code) => {
+            if (code === 0) {
+                showStatus('Export completed successfully', 'success');
+            } else {
+                showStatus('Export failed', 'error');
+            }
+        });
+
+        // Export-all progress handlers
+        ipcRenderer.on('export-all-progress', (event, message) => {
+            progress.innerHTML += message + '\n';
+            progress.scrollTop = progress.scrollHeight;
+        });
+
+        ipcRenderer.on('export-all-error', (event, message) => {
+            progress.innerHTML += `Error (export-all): ${message}\n`;
+            progress.scrollTop = progress.scrollHeight;
+        });
+
+        ipcRenderer.on('export-all-complete', (event, code) => {
+            if (code === 0) {
+                showStatus('Export-all completed successfully', 'success');
+            } else {
+                showStatus('Export-all failed', 'error');
+            }
+        });
+
+        function showStatus(message, type) {
+            status.textContent = message;
+            status.className = type;
+        }
+    </script>
+</body>
+</html> 
