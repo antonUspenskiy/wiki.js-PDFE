@@ -2799,6 +2799,66 @@ class WikiExporter {
             console.log('CONTENT-WIDTH-DEBUG', JSON.stringify(debugInfo));
         }
 
+        const manualBreakStats = await this.page.evaluate(() => {
+            const markers = Array.from(document.querySelectorAll('div.pdfe-break'));
+            if (!markers.length) {
+                return { found: 0, applied: 0, skipped: 0 };
+            }
+
+            const hasRenderableContent = el => !!(
+                el &&
+                el.querySelector &&
+                el.querySelector('img,table,video,pre,code,figure,svg,.image,.media,iframe,canvas')
+            );
+            const isInsideTable = el => !!(el && el.closest && el.closest('table, thead, tbody, tfoot, tr, td, th'));
+            const isSkippable = el => {
+                if (!el) return true;
+                if (el.classList && el.classList.contains('pdfe-break')) return true;
+                const tag = (el.tagName || '').toUpperCase();
+                if (['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE'].includes(tag)) return true;
+                if ((el.textContent || '').trim().length > 0) return false;
+                if (hasRenderableContent(el)) return false;
+                const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+                if (rect && (rect.width > 1 || rect.height > 1)) return false;
+                return true;
+            };
+            let applied = 0;
+            let skipped = 0;
+
+            markers.forEach(marker => {
+                if (isInsideTable(marker)) {
+                    skipped += 1;
+                    marker.remove();
+                    return;
+                }
+
+                let target = marker.nextElementSibling;
+                while (target && isSkippable(target)) {
+                    target = target.nextElementSibling;
+                }
+
+                if (!target || isInsideTable(target)) {
+                    skipped += 1;
+                    marker.remove();
+                    return;
+                }
+
+                target.style.setProperty('break-before', 'page', 'important');
+                target.style.setProperty('page-break-before', 'always', 'important');
+                target.setAttribute('data-user-forced-page-break', 'before');
+                target.setAttribute('data-forced-page-break', 'before');
+                applied += 1;
+                marker.remove();
+            });
+
+            return { found: markers.length, applied, skipped };
+        });
+        if (manualBreakStats.found > 0) {
+            console.log(
+                `Manual pdfe-break markers: found=${manualBreakStats.found}, applied=${manualBreakStats.applied}, skipped=${manualBreakStats.skipped}`
+            );
+        }
+
         const disableTableBreaks = Boolean(this.config.disableTableBreaks);
         // Push large tables (and their immediate headings) to the next page when too little space remains
         if (!disableTableBreaks) await this.page.evaluate(() => {
@@ -2809,6 +2869,9 @@ class WikiExporter {
             const usableHeight = pageHeightPx - marginTopPx - marginBottomPx;
             const lineHeight = parseFloat(getComputedStyle(document.body).lineHeight) || 16;
             const keepBuffer = lineHeight * 2;
+            const isUserForcedBreak = el => (
+                !!(el && el.getAttribute && el.getAttribute('data-user-forced-page-break') === 'before')
+            );
 
             const tables = Array.from(document.querySelectorAll('table')).filter(t => t.offsetParent);
             const forcedBreakTables = new Set();
@@ -2822,16 +2885,20 @@ class WikiExporter {
                 const spaceLeft = currentPageBottom - top;
 
                 // Reset any previous forced breaks so we can re-evaluate per layout.
-                table.style.breakBefore = '';
-                table.style.pageBreakBefore = '';
+                if (!isUserForcedBreak(table)) {
+                    table.style.breakBefore = '';
+                    table.style.pageBreakBefore = '';
+                }
                 table.style.breakInside = 'auto';
                 table.style.pageBreakInside = 'auto';
 
                 // Normalize nested sections/rows to avoid inherited page-break rules from site CSS.
                 ['thead', 'tbody', 'tfoot', 'tr'].forEach(sel => {
                     table.querySelectorAll(sel).forEach(el => {
-                        el.style.breakBefore = '';
-                        el.style.pageBreakBefore = '';
+                        if (!isUserForcedBreak(el)) {
+                            el.style.breakBefore = '';
+                            el.style.pageBreakBefore = '';
+                        }
                         el.style.breakInside = 'auto';
                         el.style.pageBreakInside = 'auto';
                     });
@@ -2913,8 +2980,10 @@ class WikiExporter {
             // If a heading is immediately followed by a table that is forced to next page, move the heading too
             const headings = Array.from(document.querySelectorAll('h1, h2, h3, h4, h5, h6'));
             headings.forEach(h => {
-                h.style.breakBefore = '';
-                h.style.pageBreakBefore = '';
+                if (!isUserForcedBreak(h)) {
+                    h.style.breakBefore = '';
+                    h.style.pageBreakBefore = '';
+                }
                 let next = h.nextElementSibling;
                 while (next && next.textContent.trim() === '' && !next.querySelector('img,table,video,pre,code')) {
                     next = next.nextElementSibling;
@@ -3976,6 +4045,9 @@ class WikiExporter {
                     await this.page.evaluate((tableIndices) => {
                         const tables = Array.from(document.querySelectorAll('table')).filter(t => t.offsetParent);
                         const byIndex = new Map();
+                        const isUserForcedBreak = el => (
+                            !!(el && el.getAttribute && el.getAttribute('data-user-forced-page-break') === 'before')
+                        );
                         tables.forEach((table, idx) => {
                             const attr = table.getAttribute('data-export-table-index');
                             const key = attr !== null ? Number(attr) : idx;
@@ -4012,15 +4084,22 @@ class WikiExporter {
                             const table = byIndex.get(index);
                             if (!table) return;
                             const target = findPrevHeading(table) || table;
-                            target.style.breakBefore = '';
-                            target.style.pageBreakBefore = '';
-                            table.style.breakBefore = '';
-                            table.style.pageBreakBefore = '';
-                            target.removeAttribute('data-forced-page-break');
-                            table.removeAttribute('data-forced-page-break');
-                            target.style.breakBefore = 'page';
-                            target.style.pageBreakBefore = 'always';
-                            ensureBreakBefore(target);
+                            const targetUserForced = isUserForcedBreak(target);
+                            if (!isUserForcedBreak(target)) {
+                                target.style.breakBefore = '';
+                                target.style.pageBreakBefore = '';
+                                target.removeAttribute('data-forced-page-break');
+                            }
+                            if (!isUserForcedBreak(table)) {
+                                table.style.breakBefore = '';
+                                table.style.pageBreakBefore = '';
+                                table.removeAttribute('data-forced-page-break');
+                            }
+                            target.style.setProperty('break-before', 'page', 'important');
+                            target.style.setProperty('page-break-before', 'always', 'important');
+                            if (!targetUserForced) {
+                                ensureBreakBefore(target);
+                            }
                             target.setAttribute('data-forced-page-break', 'before');
                             table.setAttribute('data-forced-page-break', 'before');
                         });

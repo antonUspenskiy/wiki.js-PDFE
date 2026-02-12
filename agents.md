@@ -51,3 +51,14 @@
 - Центрирование изображения в ячейке выполняется только когда ячейка по сути медиа-ячейка (без значимого текстового контента). В смешанных ячейках выравнивание не ломается.
 - Нельзя использовать глобальный `overflow-x: hidden` на корневом печатном контейнере как способ борьбы с переполнением таблиц.
 - Изменения логики таблиц/изображений в `Export.js` считаются частью общей PDF-логики и должны автоматически сохраняться идентичными для одиночного и массового экспорта (через запуск `Export.js` из `export-all.js`).
+
+## Links (mandatory rules)
+
+- Links to `http://192.168.219.16/` and `https://wiki.slomo.tv/` must be non-clickable in PDF and must be converted to plain text.
+- Conversion of blocked links must keep inline flow (no block-level replacement), so no extra line breaks appear before or after the text.
+- Blocked links must not keep visual link styling (blue link color, underline, link icons/markers from theme styles).
+- If blocked-link text contains domain-like tokens (for example, `site.tv`), they must not be auto-linked by PDF viewers.
+- All other links must remain clickable.
+- TOC links must remain clickable and keep a link color (default `#0066cc`, or a valid non-neutral theme link color).
+- Link-processing behavior is part of shared PDF logic in `Export.js` and must stay identical for single-page and batch export (via `export-all.js` calling `Export.js`).
+
