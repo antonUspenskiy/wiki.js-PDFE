@@ -183,6 +183,12 @@ config.footnoteFontSize = Number.isFinite(parsedFootnoteFontSize) && parsedFootn
     ? parsedFootnoteFontSize
     : defaultConfig.footnoteFontSize;
 
+const BLOCKED_LINK_ORIGINS = new Set([
+    'http://192.168.219.16',
+    'https://wiki.slomo.tv'
+].map(value => value.toLowerCase()));
+const BLOCKED_LINK_ORIGINS_LIST = Array.from(BLOCKED_LINK_ORIGINS);
+
 // Вспомогательные функции
 function getResourceType(url) {
     if (/\.(woff2?|ttf|eot)$/i.test(url)) return 'font';
@@ -340,6 +346,23 @@ function safeDecodeURIComponent(value) {
     } catch (_) {
         return value;
     }
+}
+
+function normalizeLinkOrigin(href, baseHref) {
+    const raw = String(href || '').trim();
+    if (!raw) return null;
+    try {
+        return String(baseHref ? new URL(raw, baseHref).origin : new URL(raw).origin).toLowerCase();
+    } catch (_) {
+        return null;
+    }
+}
+
+function shouldSuppressLinkHref(href, baseHref) {
+    const raw = String(href || '').trim();
+    if (!raw || raw.startsWith('#')) return false;
+    const origin = normalizeLinkOrigin(raw, baseHref);
+    return Boolean(origin && BLOCKED_LINK_ORIGINS.has(origin));
 }
 
 function sanitizeFootnoteToken(value, fallback = 'footnote') {
@@ -875,6 +898,8 @@ function resolveFootnoteLinkSpec(href, existingDestinationNames) {
         return preferred ? { type: 'internal', destName: preferred } : null;
     }
 
+    if (shouldSuppressLinkHref(raw, config && config.baseUrl)) return null;
+
     const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(raw);
     if (hasScheme || raw.startsWith('/')) {
         return { type: 'external', href: raw };
@@ -920,7 +945,8 @@ function buildFootnoteOverlayHtml(totalPages, finalFootnotePlans, options) {
         const normalizedSegments = cloneFootnoteSegments(segments);
         return normalizedSegments.map(segment => {
             const text = escapeHtml(String((segment && segment.text) || ''));
-            const href = segment && typeof segment.href === 'string' ? segment.href.trim() : '';
+            const hrefRaw = segment && typeof segment.href === 'string' ? segment.href.trim() : '';
+            const href = hrefRaw && !shouldSuppressLinkHref(hrefRaw, config && config.baseUrl) ? hrefRaw : '';
             if (href) {
                 return `<a href="${escapeHtmlAttr(href)}">${text}</a>`;
             }
@@ -1053,7 +1079,21 @@ async function estimateFootnoteAreaMmInBrowser(page, pagePlans, options) {
         return { maxRequiredMm: 0, perPageMm: new Map() };
     }
 
-    const result = await page.evaluate((inputPlans, measureOptions) => {
+    const result = await page.evaluate((inputPlans, measureOptions, blockedOrigins) => {
+        const blockedOriginSet = new Set(
+            (Array.isArray(blockedOrigins) ? blockedOrigins : [])
+                .map(value => String(value || '').trim().toLowerCase())
+                .filter(Boolean)
+        );
+        const shouldSuppressHref = (href) => {
+            const raw = String(href || '').trim();
+            if (!raw || raw.startsWith('#') || blockedOriginSet.size === 0) return false;
+            try {
+                return blockedOriginSet.has(new URL(raw, window.location.href).origin.toLowerCase());
+            } catch (_) {
+                return false;
+            }
+        };
         const pxToMm = 25.4 / 96;
         const root = document.createElement('div');
         root.id = 'export-footnote-measure-root';
@@ -1069,8 +1109,9 @@ async function estimateFootnoteAreaMmInBrowser(page, pagePlans, options) {
         const renderSegment = (segment) => {
             const href = String((segment && segment.href) || '').trim();
             const text = String((segment && segment.text) || '');
-            const node = href ? document.createElement('a') : document.createElement('span');
-            if (href) node.setAttribute('href', href);
+            const allowLink = href && !shouldSuppressHref(href);
+            const node = allowLink ? document.createElement('a') : document.createElement('span');
+            if (allowLink) node.setAttribute('href', href);
             node.textContent = text;
             return node;
         };
@@ -1137,7 +1178,7 @@ async function estimateFootnoteAreaMmInBrowser(page, pagePlans, options) {
                 displayLabel: getFootnoteDisplayLabel(item)
             }))
             : []
-    })), options);
+    })), options, BLOCKED_LINK_ORIGINS_LIST);
 
     return {
         maxRequiredMm: Number(result.maxRequiredMm) || 0,
@@ -3353,9 +3394,59 @@ class WikiExporter {
             });
         });
 
+        const disableBlockedWikiLinksFilter = false;
+        if (!disableBlockedWikiLinksFilter) await this.page.evaluate((blockedOrigins) => {
+            const blockedOriginSet = new Set(
+                (Array.isArray(blockedOrigins) ? blockedOrigins : [])
+                    .map(value => String(value || '').trim().toLowerCase())
+                    .filter(Boolean)
+            );
+            if (!blockedOriginSet.size) return;
+
+            const neutralizeAutoLinkedDomains = (text) => String(text || '').replace(
+                /\b([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z]{2,63})+)\b/gi,
+                value => value.replace(/\./g, '.\u2060')
+            );
+
+            const replaceLinkWithTextNode = (link) => {
+                if (!link || !link.parentNode) return;
+                const rawText = String(link.textContent || '').replace(/\r?\n+/g, ' ');
+                const replacement = document.createTextNode(neutralizeAutoLinkedDomains(rawText));
+                link.parentNode.replaceChild(replacement, link);
+            };
+
+            const links = Array.from(document.querySelectorAll('a[href]'));
+            links.forEach(link => {
+                const rawHref = String(link.getAttribute('href') || '').trim();
+                if (!rawHref || rawHref.startsWith('#')) return;
+                let origin = '';
+                try {
+                    origin = new URL(rawHref, window.location.href).origin.toLowerCase();
+                } catch (_) {
+                    return;
+                }
+                if (!blockedOriginSet.has(origin)) return;
+                replaceLinkWithTextNode(link);
+            });
+        }, BLOCKED_LINK_ORIGINS_LIST);
+
         const footnoteMarkerPrefix = '__FOOTNOTE_REF_MARKER__';
         const footnoteMarkerSuffix = '__END__';
-        const footnoteExtraction = await this.page.evaluate((refMarkerPrefix, refMarkerSuffix) => {
+        const footnoteExtraction = await this.page.evaluate((refMarkerPrefix, refMarkerSuffix, blockedOrigins) => {
+            const blockedOriginSet = new Set(
+                (Array.isArray(blockedOrigins) ? blockedOrigins : [])
+                    .map(value => String(value || '').trim().toLowerCase())
+                    .filter(Boolean)
+            );
+            const shouldSuppressHref = (href) => {
+                const raw = String(href || '').trim();
+                if (!raw || raw.startsWith('#') || blockedOriginSet.size === 0) return false;
+                try {
+                    return blockedOriginSet.has(new URL(raw, window.location.href).origin.toLowerCase());
+                } catch (_) {
+                    return false;
+                }
+            };
             const decodeHash = (href) => {
                 if (!href || href === '#') return null;
                 const raw = href.startsWith('#') ? href.slice(1) : href;
@@ -3450,6 +3541,9 @@ class WikiExporter {
                                     nextHref = new URL(rawHref, window.location.href).href;
                                 } catch (_) {
                                     nextHref = rawHref;
+                                }
+                                if (shouldSuppressHref(nextHref)) {
+                                    nextHref = null;
                                 }
                             }
                         }
@@ -3609,7 +3703,7 @@ class WikiExporter {
                 definitions,
                 removedBlocks: nodesToRemove.size
             };
-        }, footnoteMarkerPrefix, footnoteMarkerSuffix);
+        }, footnoteMarkerPrefix, footnoteMarkerSuffix, BLOCKED_LINK_ORIGINS_LIST);
 
         const footnoteRefs = Array.isArray(footnoteExtraction && footnoteExtraction.refs)
             ? footnoteExtraction.refs
@@ -4216,13 +4310,24 @@ class WikiExporter {
                     return null;
                 };
 
+                const isLikelyNeutral = (parsed) => {
+                    if (!parsed) return true;
+                    return Math.abs(parsed.r - parsed.g) < 18
+                        && Math.abs(parsed.g - parsed.b) < 18
+                        && Math.abs(parsed.r - parsed.b) < 18;
+                };
+
                 const linkCandidate = Array.from(document.querySelectorAll('a[href]'))
-                    .find(a => !a.closest('#export-toc') && !a.closest('#export-cover'));
+                    .filter(a => !a.closest('#export-toc') && !a.closest('#export-cover'))
+                    .find(a => {
+                        const href = String(a.getAttribute('href') || '').trim();
+                        return Boolean(href && !href.startsWith('#'));
+                    });
                 let linkColor = '#0066cc';
                 if (linkCandidate) {
                     const candidateColor = window.getComputedStyle(linkCandidate).color;
                     const parsed = parseColor(candidateColor);
-                    if (parsed && (parsed.a ?? 1) > 0.2) {
+                    if (parsed && (parsed.a ?? 1) > 0.2 && !isLikelyNeutral(parsed)) {
                         const luminance = (0.2126 * parsed.r + 0.7152 * parsed.g + 0.0722 * parsed.b) / 255;
                         if (luminance < 0.92) {
                             linkColor = candidateColor;

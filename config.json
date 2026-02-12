@@ -1,8 +1,8 @@
 {
-    "pageUrl": "http://192.168.219.16/en/documentation/rus/Multichannel_Recording/MCR_users_guide",
+    "pageUrl": "http://192.168.219.16/en/documentation/rus/videoReferee/basketball/videoReferee_engineer_guide_basketball",
     "baseUrl": "http://192.168.219.16",
     "loginPath": "/login",
-    "articlePath": "/en/documentation/rus/Multichannel_Recording/MCR_users_guide",
+    "articlePath": "/en/documentation/rus/videoReferee/basketball/videoReferee_engineer_guide_basketball",
     "credentials": {
         "email": "a.uspenskiy@slomo.tv",
         "password": "slomotv"
