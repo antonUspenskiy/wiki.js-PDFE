@@ -188,6 +188,11 @@ const BLOCKED_LINK_ORIGINS = new Set([
     'https://wiki.slomo.tv'
 ].map(value => value.toLowerCase()));
 const BLOCKED_LINK_ORIGINS_LIST = Array.from(BLOCKED_LINK_ORIGINS);
+const MARKER_SUFFIX = 'ZZENDZZ';
+const TOC_MARKER_PREFIX = 'ZZTOCMARKERZZ';
+const TABLE_ROW_MARKER_PREFIX = 'ZZTABLEROWMARKERZZ';
+const FOOTNOTE_REF_MARKER_PREFIX = 'ZZFOOTNOTEREFMARKERZZ';
+const DEBUG_MARKER_PIPELINE = process.env.PDFE_DEBUG_MARKERS === '1';
 
 // Вспомогательные функции
 function getResourceType(url) {
@@ -275,6 +280,42 @@ async function extractMarkerPagesFromPdf(pdfPath, markerPrefix, markerSuffix) {
     }
 
     return { markerPages, pageCount };
+}
+
+async function extractDestinationPagesFromPdf(pdfPath, destinationNames) {
+    const names = Array.from(new Set(
+        (Array.isArray(destinationNames) ? destinationNames : [])
+            .map(value => String(value || '').trim())
+            .filter(Boolean)
+    ));
+    const destinationPages = new Map();
+    if (!names.length) return destinationPages;
+
+    const pdfjsLib = await getPdfjsLib();
+    const data = new Uint8Array(fs.readFileSync(pdfPath));
+    const loadingTask = pdfjsLib.getDocument({ data, disableWorker: true });
+    const pdf = await loadingTask.promise;
+
+    for (const name of names) {
+        let destination = null;
+        try {
+            destination = await pdf.getDestination(name);
+        } catch (_) {
+            destination = null;
+        }
+        if (!Array.isArray(destination) || !destination[0]) continue;
+
+        try {
+            const pageIndex = await pdf.getPageIndex(destination[0]);
+            if (Number.isFinite(pageIndex) && pageIndex >= 0) {
+                destinationPages.set(name, pageIndex + 1);
+            }
+        } catch (_) {
+            // ignore unresolved destination
+        }
+    }
+
+    return destinationPages;
 }
 
 async function getPdfPageCount(pdfPath) {
@@ -1510,12 +1551,16 @@ class WikiExporter {
             console.log('Page has been successfully exported to:', this.config.outputDir);
             console.log('PDF file has been saved as:', pdfPath);
 
-            // Clean up temporary files (keep only PDF)
-            await this.cleanupTempFiles(pdfPath);
+            if (DEBUG_MARKER_PIPELINE) {
+                console.log('[marker-debug] keeping temporary files for diagnostics.');
+            } else {
+                // Clean up temporary files (keep only PDF)
+                await this.cleanupTempFiles(pdfPath);
 
-            // Run cleanup after successful export
-            console.log('\nRunning cleanup...');
-            cleanup();
+                // Run cleanup after successful export
+                console.log('\nRunning cleanup...');
+                cleanup();
+            }
 
         } catch (error) {
             console.error('Export error:', error);
@@ -3499,8 +3544,8 @@ class WikiExporter {
             });
         }, BLOCKED_LINK_ORIGINS_LIST);
 
-        const footnoteMarkerPrefix = '__FOOTNOTE_REF_MARKER__';
-        const footnoteMarkerSuffix = '__END__';
+        const footnoteMarkerPrefix = FOOTNOTE_REF_MARKER_PREFIX;
+        const footnoteMarkerSuffix = MARKER_SUFFIX;
         const footnoteExtraction = await this.page.evaluate((refMarkerPrefix, refMarkerSuffix, blockedOrigins) => {
             const blockedOriginSet = new Set(
                 (Array.isArray(blockedOrigins) ? blockedOrigins : [])
@@ -3785,12 +3830,17 @@ class WikiExporter {
             });
         }
         const hasFootnotes = footnoteRefs.length > 0 && footnoteDefinitionsById.size > 0;
+        if (DEBUG_MARKER_PIPELINE) {
+            console.log(
+                `[marker-debug] footnotes refs=${footnoteRefs.length} defs=${footnoteDefinitionsById.size} hasFootnotes=${hasFootnotes}`
+            );
+        }
 
         const disableCoverToc = false;
-        const markerPrefix = '__TOC_MARKER__';
-        const markerSuffix = '__END__';
-        const tableMarkerPrefix = '__TABLE_ROW_MARKER__';
-        const tableMarkerSuffix = '__END__';
+        const markerPrefix = TOC_MARKER_PREFIX;
+        const markerSuffix = MARKER_SUFFIX;
+        const tableMarkerPrefix = TABLE_ROW_MARKER_PREFIX;
+        const tableMarkerSuffix = MARKER_SUFFIX;
         const tocHeadings = await this.page.evaluate((markerPrefix, markerSuffix) => {
             const cleanedText = (text) => String(text || '')
                 .replace(/^[\s\u00A0\u200B\u200C\u200D\uFEFF]*\u00B6\s*/, '')
@@ -3861,28 +3911,31 @@ class WikiExporter {
                 if (!id) return;
 
                 const tocId = `export-toc-${idx}`;
-                if (!document.getElementById(tocId)) {
-                    const anchor = document.createElement('span');
-                    anchor.className = 'export-toc-anchor';
-                    anchor.id = tocId;
-                    anchor.style.display = 'block';
-                    anchor.style.height = '0';
-                    anchor.style.lineHeight = '0';
-                    anchor.style.fontSize = '0';
-                    anchor.style.pointerEvents = 'none';
-                    h.parentElement.insertBefore(anchor, h);
+                let tocAnchor = document.getElementById(tocId);
+                if (!tocAnchor) {
+                    tocAnchor = document.createElement('span');
+                    tocAnchor.className = 'export-toc-anchor';
+                    tocAnchor.id = tocId;
+                    tocAnchor.style.display = 'block';
+                    tocAnchor.style.height = '0';
+                    tocAnchor.style.lineHeight = '0';
+                    tocAnchor.style.fontSize = '0';
+                    tocAnchor.style.pointerEvents = 'none';
+                    h.parentElement.insertBefore(tocAnchor, h);
                 }
-
-                if (!h.style.position || h.style.position === 'static') {
-                    h.style.position = 'relative';
+                if (!h.contains(tocAnchor)) {
+                    h.insertBefore(tocAnchor, h.firstChild);
+                }
+                if (!tocAnchor.style.position || tocAnchor.style.position === 'static') {
+                    tocAnchor.style.position = 'relative';
                 }
 
                 const token = `${markerPrefix}${idx}${markerSuffix}`;
-                if (!h.querySelector('.export-toc-marker')) {
+                if (!tocAnchor.querySelector('.export-toc-marker')) {
                     const marker = document.createElement('span');
                     marker.className = 'export-toc-marker';
                     marker.textContent = token;
-                    h.insertBefore(marker, h.firstChild);
+                    tocAnchor.appendChild(marker);
                 }
 
                 const text = cleanedText(h.textContent.replace(token, ''));
@@ -4018,7 +4071,7 @@ class WikiExporter {
                 }, tableMarkerPrefix, tableMarkerSuffix);
             }
 
-            await this.page.pdf({ path: contentPdfPath, ...pdfOptionsNoHeader });
+            await this.page.pdf({ path: contentPdfPath, ...pdfOptionsFinal });
 
             if (!disableTableBreaks && tableMarkerIds.length) {
                 const { markerPages: tableMarkerPages } = await extractMarkerPagesFromPdf(contentPdfPath, tableMarkerPrefix, tableMarkerSuffix);
@@ -4113,7 +4166,7 @@ class WikiExporter {
                 });
 
                 if (tablesToBreak.length) {
-                    await this.page.pdf({ path: contentPdfPath, ...pdfOptionsNoHeader });
+                    await this.page.pdf({ path: contentPdfPath, ...pdfOptionsFinal });
                 }
             } else if (!disableTableBreaks) {
                 await this.page.evaluate(() => {
@@ -4134,6 +4187,11 @@ class WikiExporter {
                     footnoteMarkerSuffix
                 );
                 latestContentFootnoteMarkerPages = footnoteRefPages;
+                if (DEBUG_MARKER_PIPELINE) {
+                    console.log(
+                        `[marker-debug] content footnote markers found=${footnoteRefPages.size} refs=${footnoteRefs.length}`
+                    );
+                }
                 return buildFootnotePagePlan(footnoteRefs, footnoteRefPages, footnoteDefinitionsById);
             };
 
@@ -4188,7 +4246,12 @@ class WikiExporter {
             }
         }
 
-        const { markerPages } = await extractMarkerPagesFromPdf(contentPdfPath, markerPrefix, markerSuffix);
+        const { markerPages, pageCount: contentPageCount } = await extractMarkerPagesFromPdf(contentPdfPath, markerPrefix, markerSuffix);
+        if (DEBUG_MARKER_PIPELINE) {
+            console.log(
+                `[marker-debug] content toc markers found=${markerPages.size} headings=${tocHeadings.length} contentPdfPages=${contentPageCount}`
+            );
+        }
 
         const tocItems = tocHeadings.map(item => ({
             index: item.index,
@@ -4196,13 +4259,15 @@ class WikiExporter {
             tocId: item.tocId,
             text: item.text,
             level: item.level,
-            page: markerPages.get(item.index) || null
+            page: markerPages.get(item.index) || null,
+            resolvedPage: null
         }));
 
         const renderToc = async (items, pageOffset, showNumbers, hideContent) => {
-            await this.page.evaluate((tocItems, pageOffset, showNumbers, hideContent) => {
+            await this.page.evaluate((tocItems, pageOffset, showNumbers, hideContent, markerPrefix, markerSuffix) => {
+                const markerPattern = new RegExp(`${markerPrefix}\\d+${markerSuffix}`, 'g');
                 const cleanedText = (text) => String(text || '')
-                    .replace(/__TOC_MARKER__\d+__END__/g, '')
+                    .replace(markerPattern, '')
                     .replace(/^[\s\u00A0\u200B\u200C\u200D\uFEFF]*\u00B6\s*/, '')
                     .trim();
 
@@ -4328,7 +4393,7 @@ class WikiExporter {
                         const textNode = walker.currentNode;
                         if (textNode && textNode.nodeValue) {
                             textNode.nodeValue = textNode.nodeValue
-                                .replace(/__TOC_MARKER__\d+__END__/g, '')
+                                .replace(markerPattern, '')
                                 .replace(/\u00B6/g, '');
                         }
                     }
@@ -4439,7 +4504,9 @@ class WikiExporter {
 
                         const pageSpan = document.createElement('span');
                         pageSpan.className = 'export-toc-page';
-                        if (showNumbers && item.page !== null && item.page !== undefined) {
+                        if (showNumbers && Number.isFinite(item.resolvedPage) && item.resolvedPage > 0) {
+                            pageSpan.textContent = String(item.resolvedPage);
+                        } else if (showNumbers && item.page !== null && item.page !== undefined) {
                             pageSpan.textContent = String(item.page + pageOffset);
                         } else {
                             pageSpan.textContent = '';
@@ -4511,7 +4578,7 @@ class WikiExporter {
                     }
                 }
                 toRemove.forEach(node => node.remove());
-            }, items, pageOffset, showNumbers, hideContent);
+            }, items, pageOffset, showNumbers, hideContent, markerPrefix, markerSuffix);
         };
 
         await renderToc(tocItems, 0, false, true);
@@ -4522,14 +4589,20 @@ class WikiExporter {
         await renderToc(tocItems, tocPageCount, true, false);
 
         const probePdfPath = pdfPath.replace(/\.pdf$/i, '.probe.pdf');
-        await this.page.pdf({ path: probePdfPath, ...pdfOptionsNoHeader });
+        await this.page.pdf({ path: probePdfPath, ...pdfOptionsFinal });
 
-        const { markerPages: probeMarkerPages } = await extractMarkerPagesFromPdf(probePdfPath, markerPrefix, markerSuffix);
+        const { markerPages: probeMarkerPages, pageCount: probePageCount } = await extractMarkerPagesFromPdf(probePdfPath, markerPrefix, markerSuffix);
         const offsetCounts = new Map();
+        let tocMatchedMarkers = 0;
+        let tocMissingMarkers = 0;
         tocItems.forEach(item => {
             const contentPage = markerPages.get(item.index);
             const probePage = probeMarkerPages.get(item.index);
-            if (!contentPage || !probePage) return;
+            if (!contentPage || !probePage) {
+                tocMissingMarkers += 1;
+                return;
+            }
+            tocMatchedMarkers += 1;
             const delta = probePage - contentPage;
             offsetCounts.set(delta, (offsetCounts.get(delta) || 0) + 1);
         });
@@ -4541,10 +4614,51 @@ class WikiExporter {
                 computedOffset = delta;
             }
         });
-
-        if (computedOffset !== tocPageCount) {
-            await renderToc(tocItems, computedOffset, true, false);
+        if (DEBUG_MARKER_PIPELINE) {
+            console.log(
+                `[marker-debug] toc pages=${tocPageCount} contentMarkers=${markerPages.size} probeMarkers=${probeMarkerPages.size} contentPdfPages=${contentPageCount} probePdfPages=${probePageCount} matched=${tocMatchedMarkers} missing=${tocMissingMarkers} offsetHistogram=${JSON.stringify(Array.from(offsetCounts.entries()))} chosenOffset=${computedOffset}`
+            );
         }
+
+        const tocDestinationNames = tocItems
+            .map(item => item.tocId || item.id)
+            .filter(Boolean);
+        const probeDestinationPages = await extractDestinationPagesFromPdf(probePdfPath, tocDestinationNames);
+        let tocResolvedByDestination = 0;
+        let tocResolvedByOffset = 0;
+        let tocUnresolvedPages = 0;
+        let tocDestinationMismatches = 0;
+        tocItems.forEach(item => {
+            const destinationName = item.tocId || item.id;
+            const destinationPage = probeDestinationPages.get(destinationName);
+            const offsetBasedPage = Number.isFinite(item.page) ? item.page + computedOffset : null;
+
+            if (Number.isFinite(destinationPage) && destinationPage > 0) {
+                item.resolvedPage = destinationPage;
+                tocResolvedByDestination += 1;
+                if (Number.isFinite(offsetBasedPage) && offsetBasedPage !== destinationPage) {
+                    tocDestinationMismatches += 1;
+                }
+                return;
+            }
+
+            if (Number.isFinite(offsetBasedPage) && offsetBasedPage > 0) {
+                item.resolvedPage = offsetBasedPage;
+                tocResolvedByOffset += 1;
+                return;
+            }
+
+            item.resolvedPage = null;
+            tocUnresolvedPages += 1;
+        });
+        if (DEBUG_MARKER_PIPELINE) {
+            console.log(
+                `[marker-debug] toc destination pages resolvedByDest=${tocResolvedByDestination} resolvedByOffset=${tocResolvedByOffset} unresolved=${tocUnresolvedPages} destinationMismatches=${tocDestinationMismatches}`
+            );
+        }
+
+        await renderToc(tocItems, computedOffset, true, false);
+        await this.page.pdf({ path: probePdfPath, ...pdfOptionsFinal });
 
         await this.page.evaluate(() => {
             document.querySelectorAll('.export-toc-marker').forEach(node => node.remove());
@@ -4561,11 +4675,17 @@ class WikiExporter {
             );
 
             const footnoteOffsetCounts = new Map();
+            let footnoteMatchedMarkers = 0;
+            let footnoteMissingMarkers = 0;
             footnoteRefs.forEach(ref => {
                 if (!ref || !Number.isFinite(ref.refIndex)) return;
                 const contentPage = latestContentFootnoteMarkerPages.get(ref.refIndex);
                 const probePage = probeFootnoteMarkerPages.get(ref.refIndex);
-                if (!contentPage || !probePage) return;
+                if (!contentPage || !probePage) {
+                    footnoteMissingMarkers += 1;
+                    return;
+                }
+                footnoteMatchedMarkers += 1;
                 const delta = probePage - contentPage;
                 footnoteOffsetCounts.set(delta, (footnoteOffsetCounts.get(delta) || 0) + 1);
             });
@@ -4578,15 +4698,18 @@ class WikiExporter {
                     computedFootnoteOffset = delta;
                 }
             });
+            if (DEBUG_MARKER_PIPELINE) {
+                console.log(
+                    `[marker-debug] footnotes contentMarkers=${latestContentFootnoteMarkerPages.size} probeMarkers=${probeFootnoteMarkerPages.size} matched=${footnoteMatchedMarkers} missing=${footnoteMissingMarkers} offsetHistogram=${JSON.stringify(Array.from(footnoteOffsetCounts.entries()))} chosenOffset=${computedFootnoteOffset}`
+                );
+            }
 
             finalFootnotePlans = shiftFootnotePlansByOffset(activeFootnotePlan.pages, computedFootnoteOffset);
         }
 
-        await this.page.evaluate(() => {
-            document.querySelectorAll('.export-footnote-ref-marker').forEach(node => node.remove());
-            const footnoteMarkerStyle = document.getElementById('export-footnote-marker-style');
-            if (footnoteMarkerStyle) footnoteMarkerStyle.remove();
-        });
+        if (DEBUG_MARKER_PIPELINE) {
+            console.log('[marker-debug] retaining footnote markers before final PDF render.');
+        }
 
         await this.page.pdf({ path: pdfPath, ...pdfOptionsFinal });
 

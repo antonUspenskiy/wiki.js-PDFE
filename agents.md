@@ -62,3 +62,81 @@
 - TOC links must remain clickable and keep a link color (default `#0066cc`, or a valid non-neutral theme link color).
 - Link-processing behavior is part of shared PDF logic in `Export.js` and must stay identical for single-page and batch export (via `export-all.js` calling `Export.js`).
 
+## Инцидент 2026-02-18: рассинхрон футнотов и TOC на локальном Windows
+
+### Симптом
+- На Linux-сервере после клонирования и запуска экспорт корректный.
+- На локальной Windows-машине после `npm install` в PDF ломались:
+- позиционирование/привязка футнотов внизу страниц.
+- нумерация TOC (часть пунктов показывала страницу `N`, но ссылка вела на `N+1`/`N+2`).
+
+### Что проверяли
+- Сверяли версии Node/npm/Chrome и поведение в `headless` и не-`headless`.
+- Проверяли извлечение marker-токенов из `content/probe/final` PDF через `pdfjs-dist`.
+- Автоматически сопоставляли номер страницы из строки TOC с фактической целевой страницей PDF-дестинации ссылки.
+- Добавили диагностический режим `PDFE_DEBUG_MARKERS=1`:
+- пишет расширенные метрики marker-pipeline в лог.
+- не удаляет временные PDF (`*.content.pdf`, `*.probe.pdf`, `*.toc.tmp.pdf`) для анализа.
+- используется только для отладки.
+
+### Реальная причина
+- До финального `this.page.pdf({ ...pdfOptionsFinal })` код удалял `.export-footnote-ref-marker`.
+- Эти маркеры влияли на стабильность пагинации между стадиями `content/probe/final`.
+- После удаления маркеров финальная верстка в части случаев меняла границы страниц.
+- В итоге TOC считался по одной пагинации, а финальные ссылки попадали в другую.
+
+### Что исправили
+- Убрали удаление `.export-footnote-ref-marker` перед финальным рендером.
+- Для расчета page-offset рендер `content` и `probe` перевели на те же опции, что и финал (`pdfOptionsFinal`).
+- Привязали TOC-маркер к тому же `tocAnchor`, который используется как destination (`export-toc-*`), чтобы номер TOC и цель ссылки считались из одной точки.
+- Перевели marker-prefix/suffix на стабильный формат без `_`:
+- `ZZTOCMARKERZZ...ZZENDZZ`
+- `ZZFOOTNOTEREFMARKERZZ...ZZENDZZ`
+- `ZZTABLEROWMARKERZZ...ZZENDZZ`
+
+### Результат проверки
+- Повторный экспорт на проблемной машине дал корректный PDF.
+- TOC: 43 проверенных ссылок, `mismatches=0`.
+- Футноты: page-offset стабилен и совпадает с TOC-offset.
+- Проверка выполнена в `--headless` (тот же режим использует `export-all`).
+
+### Важно для будущих изменений
+- Не удалять `.export-footnote-ref-marker` до финального `page.pdf` без эквивалентной компенсации пагинации.
+- Любые изменения marker-pipeline проверять сравнением:
+- printed TOC page number vs destination page.
+- offset-гистограммы для TOC и footnotes.
+- Любая правка PDF-логики в `Export.js` автоматически считается общей логикой и должна оставаться идентичной для `export-all.js`.
+
+
+## Инцидент 2026-02-18: TOC drift в документе _Руководство_по_подключению.pdf
+
+### Симптом
+- После исправления базового marker-pipeline в другом документе на этом PDF оставался частичный drift TOC.
+- Проверка показала 11 TOC-ссылок, из них 2 несоответствия: в TOC печаталось `N`, но destination ссылки был на странице `N+1`.
+- Ошибка проявлялась точечно (на последних пунктах), а не на всем TOC.
+
+### Что предпринималось
+- Прогнали автоматическую сверку TOC: printed page number vs destination page (`export-toc-*`).
+- Сравнили marker-based расчет (`content/probe offset`) с фактическими destination-страницами из `probe.pdf`.
+- Подтвердили, что для части заголовков marker-page и destination-page могут расходиться на 1 страницу.
+
+### Техническая причина
+- Нумерация TOC строилась в основном по marker-based смещению.
+- В отдельных местах marker страницы и реальный destination (`#export-toc-*`) не совпадали, поэтому часть TOC-номеров уходила на `-1` относительно реальной цели ссылки.
+
+### Что исправили
+- В `Export.js` добавлен приоритет destination-based нумерации TOC:
+- из `probe.pdf` извлекаются фактические страницы destination для `export-toc-*`;
+- номер в TOC берется из destination-page;
+- marker-based `item.page + offset` используется только как fallback, если destination не удалось разрешить.
+- После пересчета TOC выполняется повторный `probe`-рендер теми же `pdfOptionsFinal`, чтобы дальнейшие шаги (включая footnote offset) считались из актуального состояния.
+
+### Результат проверки
+- Повторный экспорт `_Руководство_по_подключению.pdf` после фикса выполнен успешно.
+- Автоматическая проверка TOC: `totalLinks=11`, `checked=11`, `mismatches=0`.
+- Ссылки TOC и печатная нумерация теперь совпадают.
+
+### Важно для будущих изменений
+- TOC-нумерацию считать по фактическим destination-страницам (`export-toc-*`) как источнику истины.
+- Marker-based offset оставлять только как fallback/диагностику.
+- Любые изменения TOC pipeline обязательно валидировать автоматической проверкой `printed vs destination`.
