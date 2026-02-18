@@ -33,6 +33,8 @@ You can configure the tool in two ways:
 }
 ```
 
+Repository safety note: tracked `config.json` keeps sensitive values empty by default (`baseUrl`, `articlePath`, `credentials`, `apiKey`, `pageUrl`). Provide them via local config values or CLI arguments.
+
 2. Using command line arguments:
 ```bash
 node Export.js --base https://wiki.example.com --article /path/to/article --email user@example.com --password mypass --output ./output
@@ -62,6 +64,8 @@ npm run export-all -- --base https://wiki.example.com --apikey YOUR_TOKEN --outp
 - `--font-size`: Override base body font size in px (Export.js + export-all passthrough)
 - `--footnote-font-size`: Override footnote font size in pt (Export.js + export-all passthrough)
 - `--dry-run`: Print actions without generating files (export-all)
+- `--force-reupload`: Force rebuild of all discovered pages (export-all)
+- `--yes`: Confirm `--force-reupload` in non-interactive mode (export-all)
 - `--help`: Show help
 
 Command line arguments will override the corresponding values in the config file.
@@ -83,7 +87,19 @@ Export entire site using API key (Linux):
 npm run export-all -- --config ./config.json
 ```
 
+Force full rebuild of all pages (interactive confirmation required):
+```bash
+npm run export-all -- --config ./config.json --force-reupload
+```
+
+Force full rebuild in non-interactive mode (cron/CI):
+```bash
+npm run export-all -- --config ./config.json --force-reupload --yes
+```
+
 The exporter fetches all pages via Wiki.js GraphQL API, compares each page's last edit date with the stored PDF's metadata (or file timestamp if metadata is missing), and only regenerates PDFs for pages that changed. A `.meta.json` file is written next to each PDF with the server `updatedAt` value used for future comparisons.
+
+When `--force-reupload` is enabled, incremental freshness checks are bypassed for existing PDFs and all discovered pages are rebuilt. This mode requires an extra confirmation (`type "reupload"` interactively, or pass `--yes` for non-interactive runs).
 
 Cron example (every 30 minutes):
 ```bash

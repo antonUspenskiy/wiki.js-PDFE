@@ -99,11 +99,22 @@ Optional font overrides:
 node export-all.js --base "https://your-wiki.example.com" --apikey "YOUR_WIKIJS_API_KEY" --output "/srv/wiki-pdf" --font-size 14 --footnote-font-size 8
 ```
 
+Force full rebuild of all pages (interactive confirmation):
+```bash
+node export-all.js --base "https://your-wiki.example.com" --apikey "YOUR_WIKIJS_API_KEY" --output "/srv/wiki-pdf" --force-reupload
+```
+
+Force full rebuild for cron/CI (non-interactive confirmation):
+```bash
+node export-all.js --base "https://your-wiki.example.com" --apikey "YOUR_WIKIJS_API_KEY" --output "/srv/wiki-pdf" --force-reupload --yes
+```
+
 The `export-all.js` command:
 - fetches page list from Wiki.js GraphQL API;
 - stores PDFs in the same folder hierarchy as wiki paths;
 - creates missing PDFs;
 - regenerates only outdated PDFs (based on page `updatedAt` vs saved `.meta.json`);
+- can force rebuild all discovered pages via `--force-reupload` (extra confirmation required);
 - prints detailed logs to stdout/stderr for cron.
 
 Example crontab (every hour):

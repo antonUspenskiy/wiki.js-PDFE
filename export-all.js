@@ -2,6 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 const { spawn } = require('child_process');
+const readline = require('readline');
 const yargs = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
 
@@ -43,6 +44,16 @@ const argv = yargs(hideBin(process.argv))
     .option('dry-run', {
         type: 'boolean',
         description: 'Only print sync actions without exporting PDFs',
+        default: false
+    })
+    .option('force-reupload', {
+        type: 'boolean',
+        description: 'Force re-export of all discovered pages, ignoring incremental freshness checks',
+        default: false
+    })
+    .option('yes', {
+        type: 'boolean',
+        description: 'Confirm force-reupload for non-interactive runs',
         default: false
     })
     .help()
@@ -120,6 +131,20 @@ function readJsonSafe(filePath) {
 
 function writeJson(filePath, value) {
     fs.writeFileSync(filePath, JSON.stringify(value, null, 2), 'utf8');
+}
+
+function prompt(question) {
+    return new Promise((resolve) => {
+        const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout
+        });
+
+        rl.question(question, (answer) => {
+            rl.close();
+            resolve(answer);
+        });
+    });
 }
 
 function ensureDirectory(dirPath) {
@@ -354,7 +379,7 @@ function buildMetaRecord(page, pageUrl, sourceUpdatedAt, generatedAt) {
     };
 }
 
-function evaluateSyncState(page, pdfPath, metaPath) {
+function evaluateSyncState(page, pdfPath, metaPath, forceReupload = false) {
     const sourceUpdatedAt = normalizeTimestamp(page.updatedAt);
 
     if (!fs.existsSync(pdfPath)) {
@@ -362,6 +387,15 @@ function evaluateSyncState(page, pdfPath, metaPath) {
             shouldExport: true,
             action: 'create',
             reason: 'pdf_missing',
+            sourceUpdatedAt
+        };
+    }
+
+    if (forceReupload) {
+        return {
+            shouldExport: true,
+            action: 'update',
+            reason: 'force_reupload',
             sourceUpdatedAt
         };
     }
@@ -478,7 +512,8 @@ function loadRuntimeConfig() {
         timeout: 30000,
         fontSize: null,
         footnoteFontSize: null,
-        dryRun: false
+        dryRun: false,
+        forceReupload: false
     };
 
     let fileConfig = {};
@@ -504,6 +539,8 @@ function loadRuntimeConfig() {
     if (typeof argv.fontSize === 'number') merged.fontSize = argv.fontSize;
     if (typeof argv.footnoteFontSize === 'number') merged.footnoteFontSize = argv.footnoteFontSize;
     merged.dryRun = Boolean(argv.dryRun);
+    merged.forceReupload = Boolean(argv.forceReupload);
+    merged.confirmForceReupload = Boolean(argv.yes);
 
     if (!merged.baseUrl) throw new Error('Missing base URL. Use --base or config.baseUrl');
     if (!merged.apiKey) throw new Error('Missing API key. Use --apikey or config.apiKey');
@@ -519,8 +556,30 @@ function loadRuntimeConfig() {
     return merged;
 }
 
+async function confirmForceReupload(config) {
+    if (!config.forceReupload) return;
+
+    if (config.confirmForceReupload) {
+        log('WARN', 'Force reupload confirmed via --yes. All discovered pages will be rebuilt.');
+        return;
+    }
+
+    if (!process.stdin.isTTY || !process.stdout.isTTY) {
+        throw new Error('Force reupload requires confirmation. Re-run with --force-reupload --yes for non-interactive mode.');
+    }
+
+    log('WARN', 'Force reupload mode requested. All discovered pages will be rebuilt.');
+    const answer = await prompt('Type "reupload" to continue: ');
+    if (String(answer || '').trim().toLowerCase() !== 'reupload') {
+        throw new Error('Force reupload canceled by user.');
+    }
+
+    log('WARN', 'Force reupload confirmed interactively.');
+}
+
 async function main() {
     const config = loadRuntimeConfig();
+    await confirmForceReupload(config);
     ensureDirectory(config.outputDir);
 
     log('INFO', 'Starting export-all sync run.');
@@ -529,6 +588,9 @@ async function main() {
     log('INFO', `API key: ${maskApiKey(config.apiKey)}`);
     if (config.dryRun) {
         log('INFO', 'Dry-run mode is enabled. No files will be written.');
+    }
+    if (config.forceReupload) {
+        log('WARN', 'Force reupload mode is enabled. Incremental checks are bypassed for existing PDFs.');
     }
 
     const pages = await fetchWikiPages(config.baseUrl, config.apiKey, config.timeout);
@@ -553,7 +615,7 @@ async function main() {
         const pageUrl = `${config.baseUrl}${articlePath}`;
         const itemLabel = `${index + 1}/${pages.length} ${articlePath}`;
 
-        const syncState = evaluateSyncState(page, absolutePdfPath, metaPath);
+        const syncState = evaluateSyncState(page, absolutePdfPath, metaPath, config.forceReupload);
         if (!syncState.shouldExport) {
             stats.skipped += 1;
             log('SKIP', `${itemLabel} (${syncState.reason})`);

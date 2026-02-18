@@ -1,7 +1,7 @@
 const puppeteer = require('puppeteer-core');
 const fs = require('fs');
 const path = require('path');
-const { PDFDocument, StandardFonts, rgb, PDFName, PDFArray } = require('pdf-lib');
+const { PDFDocument, StandardFonts, rgb, PDFName, PDFArray, PDFString } = require('pdf-lib');
 const yargs = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
 const cleanup = require('./cleanup');
@@ -282,6 +282,51 @@ async function extractMarkerPagesFromPdf(pdfPath, markerPrefix, markerSuffix) {
     return { markerPages, pageCount };
 }
 
+async function extractMarkerPositionsFromPdf(pdfPath, markerPrefix, markerSuffix) {
+    const pdfjsLib = await getPdfjsLib();
+    const data = new Uint8Array(fs.readFileSync(pdfPath));
+    const loadingTask = pdfjsLib.getDocument({ data, disableWorker: true });
+    const pdf = await loadingTask.promise;
+    const pageCount = pdf.numPages;
+    const markerPositions = new Map();
+    const pattern = new RegExp(`${escapeRegExp(markerPrefix)}(\\d+)${escapeRegExp(markerSuffix)}`, 'g');
+
+    for (let pageIndex = 1; pageIndex <= pageCount; pageIndex++) {
+        const page = await pdf.getPage(pageIndex);
+        const viewport = page.getViewport({ scale: 1 });
+        const textContent = await page.getTextContent();
+        const items = Array.isArray(textContent && textContent.items) ? textContent.items : [];
+
+        items.forEach(item => {
+            const rawText = String((item && item.str) || '');
+            if (!rawText) return;
+            const normalized = rawText.replace(/\s+/g, '');
+            if (!normalized) return;
+
+            pattern.lastIndex = 0;
+            let match;
+            while ((match = pattern.exec(normalized)) !== null) {
+                const index = Number(match[1]);
+                if (Number.isNaN(index) || markerPositions.has(index)) continue;
+
+                const transform = Array.isArray(item.transform) ? item.transform : [];
+                const xPt = Number(transform[4]);
+                const yPt = Number(transform[5]);
+                const yFromTopPt = Number.isFinite(yPt) ? Math.max(0, viewport.height - yPt) : null;
+
+                markerPositions.set(index, {
+                    page: pageIndex,
+                    xPt: Number.isFinite(xPt) ? xPt : null,
+                    yPt: Number.isFinite(yPt) ? yPt : null,
+                    yFromTopPt: Number.isFinite(yFromTopPt) ? yFromTopPt : null
+                });
+            }
+        });
+    }
+
+    return { markerPositions, pageCount };
+}
+
 async function extractDestinationPagesFromPdf(pdfPath, destinationNames) {
     const names = Array.from(new Set(
         (Array.isArray(destinationNames) ? destinationNames : [])
@@ -445,6 +490,38 @@ function cloneFootnoteSegments(segments) {
     });
 
     return normalized;
+}
+
+function buildInternalAnchorCandidates(anchorId) {
+    const raw = String(anchorId || '').trim();
+    if (!raw) return [];
+    const decoded = safeDecodeURIComponent(raw);
+    let encodedDecoded = '';
+    try {
+        encodedDecoded = encodeURIComponent(decoded);
+    } catch (_) {
+        encodedDecoded = '';
+    }
+    return Array.from(new Set([raw, decoded, encodedDecoded]
+        .map(value => String(value || '').trim())
+        .filter(Boolean)));
+}
+
+function collectFootnoteInternalAnchorIds(finalFootnotePlans) {
+    const ids = new Set();
+    (Array.isArray(finalFootnotePlans) ? finalFootnotePlans : []).forEach(plan => {
+        const items = plan && Array.isArray(plan.items) ? plan.items : [];
+        items.forEach(item => {
+            const segments = item && Array.isArray(item.segments) ? item.segments : [];
+            segments.forEach(segment => {
+                const href = String((segment && segment.href) || '').trim();
+                if (!href.startsWith('#')) return;
+                const rawHash = href.slice(1);
+                buildInternalAnchorCandidates(rawHash).forEach(candidate => ids.add(candidate));
+            });
+        });
+    });
+    return Array.from(ids);
 }
 
 function buildFootnoteSegmentsKey(segments) {
@@ -906,7 +983,7 @@ function addPdfLinkAnnotation(pdfDoc, page, rect, linkSpec) {
         base.A = pdfDoc.context.obj({
             Type: 'Action',
             S: 'URI',
-            URI: linkSpec.href
+            URI: PDFString.of(String(linkSpec.href || ''))
         });
     } else if (linkSpec.type === 'internal') {
         const destName = getPdfNameOrNull(linkSpec.destName);
@@ -934,8 +1011,10 @@ function resolveFootnoteLinkSpec(href, existingDestinationNames) {
             .map(value => String(value || '').trim())
             .filter(Boolean);
         const uniqueCandidates = Array.from(new Set(candidates));
-        const preferred = uniqueCandidates.find(candidate => existingDestinationNames.has(candidate))
-            || uniqueCandidates[0];
+        const canResolveInternal = existingDestinationNames && typeof existingDestinationNames.has === 'function';
+        const preferred = canResolveInternal
+            ? uniqueCandidates.find(candidate => existingDestinationNames.has(candidate))
+            : null;
         return preferred ? { type: 'internal', destName: preferred } : null;
     }
 
@@ -968,19 +1047,7 @@ function buildFootnoteOverlayHtml(totalPages, finalFootnotePlans, options) {
         byPage.set(plan.finalPage, plan);
     });
 
-    const internalAnchorIds = new Set();
-    byPage.forEach(plan => {
-        (plan.items || []).forEach(item => {
-            (item.segments || []).forEach(segment => {
-                const href = String((segment && segment.href) || '').trim();
-                if (!href.startsWith('#')) return;
-                const raw = href.slice(1);
-                if (raw) internalAnchorIds.add(raw);
-                const decoded = safeDecodeURIComponent(raw);
-                if (decoded) internalAnchorIds.add(decoded);
-            });
-        });
-    });
+    const internalAnchorIds = collectFootnoteInternalAnchorIds(finalFootnotePlans);
 
     const renderSegments = (segments) => {
         const normalizedSegments = cloneFootnoteSegments(segments);
@@ -995,7 +1062,7 @@ function buildFootnoteOverlayHtml(totalPages, finalFootnotePlans, options) {
         }).join('');
     };
 
-    const anchorBank = Array.from(internalAnchorIds)
+    const anchorBank = internalAnchorIds
         .filter(Boolean)
         .map(id => `<a id="${escapeHtmlAttr(id)}" name="${escapeHtmlAttr(id)}"></a>`)
         .join('');
@@ -1238,18 +1305,27 @@ async function injectFootnotesOverlayIntoPdf(browser, pdfPath, finalFootnotePlan
     const basePdfDoc = await PDFDocument.load(basePdfBytes);
     const totalPages = basePdfDoc.getPageCount();
     if (totalPages <= 0) return;
+    const internalAnchorDestinationEntries = (() => {
+        const input = options && (options.internalAnchorDestinations || options.internalAnchorPages);
+        if (input instanceof Map) return Array.from(input.entries());
+        if (Array.isArray(input)) return input;
+        if (input && typeof input === 'object') return Object.entries(input);
+        return [];
+    })();
 
     const overlayPdfPath = pdfPath.replace(/\.pdf$/i, '.footnotes.overlay.pdf');
     const overlayHtml = buildFootnoteOverlayHtml(totalPages, finalFootnotePlans, options);
     const overlayPage = await browser.newPage();
     let overlayDestinationCoordinates = [];
+    let overlayLinkCoordinates = [];
     try {
         await overlayPage.setViewport({ width: 1200, height: 900, deviceScaleFactor: 1 });
         await overlayPage.setContent(overlayHtml, { waitUntil: 'networkidle0' });
         await overlayPage.emulateMediaType('screen');
-        overlayDestinationCoordinates = await overlayPage.evaluate(() => {
+        const overlayScan = await overlayPage.evaluate(() => {
             const pxToPt = 72 / 96;
             const destinations = [];
+            const links = [];
             const anchors = Array.from(document.querySelectorAll('.footnote-anchor[data-dest-name]'));
             anchors.forEach(anchor => {
                 const destName = String(anchor.getAttribute('data-dest-name') || '').trim();
@@ -1271,8 +1347,38 @@ async function injectFootnotesOverlayIntoPdf(browser, pdfPath, finalFootnotePlan
                     yFromTopPt
                 });
             });
-            return destinations;
+            const footnoteLinks = Array.from(document.querySelectorAll('.footnote-content a[href]'));
+            footnoteLinks.forEach(link => {
+                const href = String(link.getAttribute('href') || '').trim();
+                if (!href) return;
+
+                const pageNode = link.closest('.overlay-page');
+                if (!pageNode) return;
+                const pageNumber = Number(pageNode.getAttribute('data-page-number'));
+                if (!Number.isFinite(pageNumber)) return;
+
+                const pageRect = pageNode.getBoundingClientRect();
+                const rects = Array.from(link.getClientRects());
+                rects.forEach(rect => {
+                    if (!rect || rect.width <= 0 || rect.height <= 0) return;
+                    links.push({
+                        href,
+                        pageNumber,
+                        x1Pt: (rect.left - pageRect.left) * pxToPt,
+                        y1FromTopPt: (rect.top - pageRect.top) * pxToPt,
+                        x2Pt: (rect.right - pageRect.left) * pxToPt,
+                        y2FromTopPt: (rect.bottom - pageRect.top) * pxToPt
+                    });
+                });
+            });
+            return { destinations, links };
         });
+        overlayDestinationCoordinates = Array.isArray(overlayScan && overlayScan.destinations)
+            ? overlayScan.destinations
+            : [];
+        overlayLinkCoordinates = Array.isArray(overlayScan && overlayScan.links)
+            ? overlayScan.links
+            : [];
         await overlayPage.pdf({
             path: overlayPdfPath,
             format: 'A4',
@@ -1293,39 +1399,18 @@ async function injectFootnotesOverlayIntoPdf(browser, pdfPath, finalFootnotePlan
 
     const overlayIndices = Array.from({ length: pagesToMerge }, (_, index) => index);
     const embeddedOverlayPages = await basePdfDoc.embedPdf(overlayPdfBytes, overlayIndices);
-    const copiedOverlayPages = await basePdfDoc.copyPages(
-        overlayPdfDoc,
-        overlayIndices
-    );
     const basePages = basePdfDoc.getPages();
 
     for (let pageIndex = 0; pageIndex < pagesToMerge; pageIndex += 1) {
         const basePage = basePages[pageIndex];
         const embeddedOverlayPage = embeddedOverlayPages[pageIndex];
-        const copiedOverlayPage = copiedOverlayPages[pageIndex];
-        if (!basePage || !embeddedOverlayPage || !copiedOverlayPage) continue;
+        if (!basePage || !embeddedOverlayPage) continue;
 
         basePage.drawPage(embeddedOverlayPage);
-
-        const overlayAnnotsRef = copiedOverlayPage.node.get(PDFName.of('Annots'));
-        if (overlayAnnotsRef) {
-            const overlayAnnots = basePdfDoc.context.lookup(overlayAnnotsRef);
-            if (overlayAnnots instanceof PDFArray) {
-                const baseAnnots = ensurePdfPageAnnotationsArray(basePdfDoc, basePage);
-                for (let idx = 0; idx < overlayAnnots.size(); idx += 1) {
-                    const annotRef = overlayAnnots.get(idx);
-                    if (!annotRef) continue;
-                    const annotDict = basePdfDoc.context.lookup(annotRef);
-                    if (annotDict && typeof annotDict.set === 'function') {
-                        annotDict.set(PDFName.of('P'), basePage.ref);
-                    }
-                    baseAnnots.push(annotRef);
-                }
-            }
-        }
     }
 
     const baseDests = ensurePdfDestinationsDict(basePdfDoc);
+    const existingDestinationNames = collectExistingDestinationNames(basePdfDoc);
     const seenDestinationNames = new Set();
     (Array.isArray(overlayDestinationCoordinates) ? overlayDestinationCoordinates : [])
         .forEach(dest => {
@@ -1345,7 +1430,80 @@ async function injectFootnotesOverlayIntoPdf(browser, pdfPath, finalFootnotePlan
 
             setPdfNamedDestination(basePdfDoc, baseDests, dest.destName, targetPage, xPt, yPt);
             seenDestinationNames.add(dest.destName);
+            existingDestinationNames.add(dest.destName);
         });
+
+    internalAnchorDestinationEntries.forEach(entry => {
+        if (!Array.isArray(entry) || entry.length < 2) return;
+        const anchorId = String(entry[0] || '').trim();
+        const destination = entry[1];
+        if (!anchorId) return;
+
+        let pageNumber = null;
+        let xPt = null;
+        let yPt = null;
+        let yFromTopPt = null;
+
+        if (Number.isFinite(Number(destination))) {
+            pageNumber = Number(destination);
+        } else if (destination && typeof destination === 'object') {
+            pageNumber = Number(destination.pageNumber ?? destination.page);
+            xPt = Number(destination.xPt);
+            yPt = Number(destination.yPt);
+            yFromTopPt = Number(destination.yFromTopPt);
+        }
+        if (!Number.isFinite(pageNumber)) return;
+
+        const pageIndex = pageNumber - 1;
+        if (!Number.isFinite(pageIndex) || pageIndex < 0 || pageIndex >= basePages.length) return;
+        const targetPage = basePages[pageIndex];
+        if (!targetPage) return;
+
+        const pageHeightPt = targetPage.getHeight();
+        const targetXPt = Number.isFinite(xPt) ? xPt : 0;
+        let targetYPt = Number.isFinite(yPt) ? yPt : null;
+        if (!Number.isFinite(targetYPt) && Number.isFinite(yFromTopPt)) {
+            targetYPt = pageHeightPt - yFromTopPt;
+        }
+        if (!Number.isFinite(targetYPt)) {
+            targetYPt = pageHeightPt;
+        }
+        targetYPt = Math.max(0, Math.min(pageHeightPt, targetYPt));
+
+        buildInternalAnchorCandidates(anchorId).forEach(candidate => {
+            if (!candidate || existingDestinationNames.has(candidate)) return;
+            if (setPdfNamedDestination(basePdfDoc, baseDests, candidate, targetPage, targetXPt, targetYPt)) {
+                existingDestinationNames.add(candidate);
+            }
+        });
+    });
+
+    (Array.isArray(overlayLinkCoordinates) ? overlayLinkCoordinates : []).forEach(link => {
+        if (!link) return;
+        const href = String(link.href || '').trim();
+        if (!href) return;
+
+        const pageIndex = Number(link.pageNumber) - 1;
+        if (!Number.isFinite(pageIndex) || pageIndex < 0 || pageIndex >= basePages.length) return;
+        const targetPage = basePages[pageIndex];
+        if (!targetPage) return;
+
+        const x1Pt = Number(link.x1Pt);
+        const x2Pt = Number(link.x2Pt);
+        const y1FromTopPt = Number(link.y1FromTopPt);
+        const y2FromTopPt = Number(link.y2FromTopPt);
+        if (!Number.isFinite(x1Pt) || !Number.isFinite(x2Pt) || !Number.isFinite(y1FromTopPt) || !Number.isFinite(y2FromTopPt)) {
+            return;
+        }
+
+        const linkSpec = resolveFootnoteLinkSpec(href, existingDestinationNames);
+        if (!linkSpec) return;
+
+        const pageHeightPt = targetPage.getHeight();
+        const y1Pt = pageHeightPt - y2FromTopPt;
+        const y2Pt = pageHeightPt - y1FromTopPt;
+        addPdfLinkAnnotation(basePdfDoc, targetPage, [x1Pt, y1Pt, x2Pt, y2Pt], linkSpec);
+    });
 
     const outputBytes = await basePdfDoc.save();
     fs.writeFileSync(pdfPath, outputBytes);
@@ -4707,11 +4865,126 @@ class WikiExporter {
             finalFootnotePlans = shiftFootnotePlansByOffset(activeFootnotePlan.pages, computedFootnoteOffset);
         }
 
+        const footnoteAnchorMarkerPrefix = 'ZZFOOTNOTEANCHORMARKERZZ';
+        const footnoteAnchorMarkerSuffix = 'ZZENDZZ';
+        let footnoteAnchorMarkerAssignments = [];
+        let footnoteInternalAnchorDestinations = new Map();
+        if (finalFootnotePlans.length > 0) {
+            const internalAnchorIds = collectFootnoteInternalAnchorIds(finalFootnotePlans);
+            if (internalAnchorIds.length > 0) {
+                footnoteAnchorMarkerAssignments = await this.page.evaluate((anchorIds, markerPrefix, markerSuffix) => {
+                    if (document.getElementById('export-footnote-anchor-marker-style')) {
+                        document.getElementById('export-footnote-anchor-marker-style').remove();
+                    }
+                    document.querySelectorAll('.export-footnote-anchor-marker').forEach(node => node.remove());
+
+                    const style = document.createElement('style');
+                    style.id = 'export-footnote-anchor-marker-style';
+                    style.textContent = `
+                        .export-footnote-anchor-marker {
+                            position: absolute;
+                            left: 0;
+                            top: 0;
+                            font-size: 2px;
+                            line-height: 2px;
+                            opacity: 0.02;
+                            color: rgba(0, 0, 0, 0.02);
+                            pointer-events: none;
+                        }
+                    `;
+                    document.head.appendChild(style);
+
+                    const assignments = [];
+                    let markerIndex = 0;
+                    const toCandidates = (value) => {
+                        const raw = String(value || '').trim();
+                        if (!raw) return [];
+                        let decoded = raw;
+                        try {
+                            decoded = decodeURIComponent(raw);
+                        } catch (_) {
+                            decoded = raw;
+                        }
+                        let encodedDecoded = '';
+                        try {
+                            encodedDecoded = encodeURIComponent(decoded);
+                        } catch (_) {
+                            encodedDecoded = '';
+                        }
+                        return Array.from(new Set([raw, decoded, encodedDecoded]
+                            .map(item => String(item || '').trim())
+                            .filter(Boolean)));
+                    };
+
+                    (Array.isArray(anchorIds) ? anchorIds : []).forEach(rawId => {
+                        const id = String(rawId || '').trim();
+                        if (!id) return;
+                        let target = null;
+                        const candidates = toCandidates(id);
+                        for (let idx = 0; idx < candidates.length; idx += 1) {
+                            const found = document.getElementById(candidates[idx]);
+                            if (found) {
+                                target = found;
+                                break;
+                            }
+                        }
+                        if (!target) return;
+
+                        const marker = document.createElement('span');
+                        marker.className = 'export-footnote-anchor-marker';
+                        marker.setAttribute('data-anchor-marker-index', String(markerIndex));
+                        marker.setAttribute('data-anchor-id', id);
+                        marker.textContent = `${markerPrefix}${markerIndex}${markerSuffix}`;
+
+                        const host = target.parentElement || target;
+                        if (host && host.style && (!host.style.position || host.style.position === 'static')) {
+                            host.style.position = 'relative';
+                        }
+
+                        if (target.parentElement) {
+                            target.parentElement.insertBefore(marker, target);
+                        } else {
+                            target.insertBefore(marker, target.firstChild);
+                        }
+
+                        assignments.push({ id, index: markerIndex });
+                        markerIndex += 1;
+                    });
+
+                    return assignments;
+                }, internalAnchorIds, footnoteAnchorMarkerPrefix, footnoteAnchorMarkerSuffix);
+            }
+        }
+
         if (DEBUG_MARKER_PIPELINE) {
             console.log('[marker-debug] retaining footnote markers before final PDF render.');
         }
 
         await this.page.pdf({ path: pdfPath, ...pdfOptionsFinal });
+
+        if (Array.isArray(footnoteAnchorMarkerAssignments) && footnoteAnchorMarkerAssignments.length > 0) {
+            const { markerPositions: footnoteAnchorMarkerPositions } = await extractMarkerPositionsFromPdf(
+                pdfPath,
+                footnoteAnchorMarkerPrefix,
+                footnoteAnchorMarkerSuffix
+            );
+            footnoteAnchorMarkerAssignments.forEach(item => {
+                if (!item || typeof item.id !== 'string') return;
+                const markerIndex = Number(item.index);
+                if (!Number.isFinite(markerIndex)) return;
+                const markerPosition = footnoteAnchorMarkerPositions.get(markerIndex);
+                if (!markerPosition || !Number.isFinite(markerPosition.page) || markerPosition.page <= 0) return;
+                footnoteInternalAnchorDestinations.set(item.id, markerPosition);
+            });
+        }
+
+        if (finalFootnotePlans.length > 0) {
+            await this.page.evaluate(() => {
+                document.querySelectorAll('.export-footnote-anchor-marker').forEach(node => node.remove());
+                const style = document.getElementById('export-footnote-anchor-marker-style');
+                if (style) style.remove();
+            });
+        }
 
         if (finalFootnotePlans.length > 0) {
             await injectFootnotesOverlayIntoPdf(this.browser, pdfPath, finalFootnotePlans, {
@@ -4723,7 +4996,8 @@ class WikiExporter {
                 lineHeightMultiplier: footnoteLineHeightMultiplier,
                 itemGapMm: ptToMm(footnoteItemGapPt),
                 topPaddingMm: ptToMm(footnoteTopPaddingPt),
-                bottomPaddingMm: ptToMm(footnoteBottomPaddingPt)
+                bottomPaddingMm: ptToMm(footnoteBottomPaddingPt),
+                internalAnchorDestinations: footnoteInternalAnchorDestinations
             });
         }
 

@@ -1,17 +1,17 @@
 {
-    "pageUrl": "http://192.168.219.16/en/documentation/rus/videoReferee/basketball/videoReferee_engineer_guide_basketball",
-    "baseUrl": "http://192.168.219.16",
+    "pageUrl": "",
+    "baseUrl": "",
     "loginPath": "/login",
-    "articlePath": "/en/documentation/rus/videoReferee/basketball/videoReferee_engineer_guide_basketball",
+    "articlePath": "",
     "credentials": {
-        "email": "a.uspenskiy@slomo.tv",
-        "password": "slomotv"
+        "email": "",
+        "password": ""
     },
-    "outputDir": "C:\\Users\\TechWriter\\Desktop\\test",
+    "outputDir": "./exported",
     "timeout": 30000,
     "fontSize": 14,
     "footnoteFontSize": 8,
     "debugTableMarkers": true,
     "keepTempPdfs": true,
-    "apiKey": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJhcGkiOjMsImdycCI6MSwiaWF0IjoxNzY5NDQzMDI1LCJleHAiOjE4MDEwMDA2MjUsImF1ZCI6InVybjp3aWtpLmpzIiwiaXNzIjoidXJuOndpa2kuanMifQ.zSutXTGF1020zefsobPqd5GtE4rJ1RFIHQWIMJr-C8OsjTYGg5HEwTnMMaPvBoa2NOZM-ce-ceDIyx4QGJGOnAc1kVQdEgXzIohSrhl8k81ZVJPBlM-wQJPgUzXWtvMKk8Y9NC2uF0e7c-Sw_kMla1NKh9l64Z6MMHIrWeLnP6rpZlJ-Sk1q89qJ-zC99qTsXn6vjgP0ksyOPZ12INVIv8zU5X2POiCIGpgIy8W5EU9ky2d5wtxbYa2frvBf7UhN-9vuYiDuvVgwSLtqUhjE-OYjL9PSv4YNjEw6R42PAIp8dro4EvT1ZqhRra1IlqAxz2MDAhFcJ3gwdwgF7n2iqw"
+    "apiKey": ""
 }
