@@ -1,7 +1,7 @@
 const puppeteer = require('puppeteer-core');
 const fs = require('fs');
 const path = require('path');
-const { PDFDocument, StandardFonts, rgb, PDFName, PDFArray } = require('pdf-lib');
+const { PDFDocument, StandardFonts, rgb, PDFName, PDFArray, PDFString } = require('pdf-lib');
 const yargs = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
 const cleanup = require('./cleanup');
@@ -275,6 +275,51 @@ async function extractMarkerPagesFromPdf(pdfPath, markerPrefix, markerSuffix) {
     }
 
     return { markerPages, pageCount };
+}
+
+async function extractMarkerPositionsFromPdf(pdfPath, markerPrefix, markerSuffix) {
+    const pdfjsLib = await getPdfjsLib();
+    const data = new Uint8Array(fs.readFileSync(pdfPath));
+    const loadingTask = pdfjsLib.getDocument({ data, disableWorker: true });
+    const pdf = await loadingTask.promise;
+    const pageCount = pdf.numPages;
+    const markerPositions = new Map();
+    const pattern = new RegExp(`${escapeRegExp(markerPrefix)}(\\d+)${escapeRegExp(markerSuffix)}`, 'g');
+
+    for (let pageIndex = 1; pageIndex <= pageCount; pageIndex++) {
+        const page = await pdf.getPage(pageIndex);
+        const viewport = page.getViewport({ scale: 1 });
+        const textContent = await page.getTextContent();
+        const items = Array.isArray(textContent && textContent.items) ? textContent.items : [];
+
+        items.forEach(item => {
+            const rawText = String((item && item.str) || '');
+            if (!rawText) return;
+            const normalized = rawText.replace(/\s+/g, '');
+            if (!normalized) return;
+
+            pattern.lastIndex = 0;
+            let match;
+            while ((match = pattern.exec(normalized)) !== null) {
+                const index = Number(match[1]);
+                if (Number.isNaN(index) || markerPositions.has(index)) continue;
+
+                const transform = Array.isArray(item.transform) ? item.transform : [];
+                const xPt = Number(transform[4]);
+                const yPt = Number(transform[5]);
+                const yFromTopPt = Number.isFinite(yPt) ? Math.max(0, viewport.height - yPt) : null;
+
+                markerPositions.set(index, {
+                    page: pageIndex,
+                    xPt: Number.isFinite(xPt) ? xPt : null,
+                    yPt: Number.isFinite(yPt) ? yPt : null,
+                    yFromTopPt: Number.isFinite(yFromTopPt) ? yFromTopPt : null
+                });
+            }
+        });
+    }
+
+    return { markerPositions, pageCount };
 }
 
 async function getPdfPageCount(pdfPath) {
@@ -897,7 +942,7 @@ function addPdfLinkAnnotation(pdfDoc, page, rect, linkSpec) {
         base.A = pdfDoc.context.obj({
             Type: 'Action',
             S: 'URI',
-            URI: linkSpec.href
+            URI: PDFString.of(String(linkSpec.href || ''))
         });
     } else if (linkSpec.type === 'internal') {
         const destName = getPdfNameOrNull(linkSpec.destName);
@@ -1219,8 +1264,8 @@ async function injectFootnotesOverlayIntoPdf(browser, pdfPath, finalFootnotePlan
     const basePdfDoc = await PDFDocument.load(basePdfBytes);
     const totalPages = basePdfDoc.getPageCount();
     if (totalPages <= 0) return;
-    const internalAnchorPageEntries = (() => {
-        const input = options && options.internalAnchorPages;
+    const internalAnchorDestinationEntries = (() => {
+        const input = options && (options.internalAnchorDestinations || options.internalAnchorPages);
         if (input instanceof Map) return Array.from(input.entries());
         if (Array.isArray(input)) return input;
         if (input && typeof input === 'object') return Object.entries(input);
@@ -1347,21 +1392,47 @@ async function injectFootnotesOverlayIntoPdf(browser, pdfPath, finalFootnotePlan
             existingDestinationNames.add(dest.destName);
         });
 
-    internalAnchorPageEntries.forEach(entry => {
+    internalAnchorDestinationEntries.forEach(entry => {
         if (!Array.isArray(entry) || entry.length < 2) return;
         const anchorId = String(entry[0] || '').trim();
-        const pageNumber = Number(entry[1]);
-        if (!anchorId || !Number.isFinite(pageNumber)) return;
+        const destination = entry[1];
+        if (!anchorId) return;
+
+        let pageNumber = null;
+        let xPt = null;
+        let yPt = null;
+        let yFromTopPt = null;
+
+        if (Number.isFinite(Number(destination))) {
+            pageNumber = Number(destination);
+        } else if (destination && typeof destination === 'object') {
+            pageNumber = Number(destination.pageNumber ?? destination.page);
+            xPt = Number(destination.xPt);
+            yPt = Number(destination.yPt);
+            yFromTopPt = Number(destination.yFromTopPt);
+        }
+
+        if (!Number.isFinite(pageNumber)) return;
 
         const pageIndex = pageNumber - 1;
         if (!Number.isFinite(pageIndex) || pageIndex < 0 || pageIndex >= basePages.length) return;
         const targetPage = basePages[pageIndex];
         if (!targetPage) return;
 
-        const topY = targetPage.getHeight();
+        const pageHeightPt = targetPage.getHeight();
+        const targetXPt = Number.isFinite(xPt) ? xPt : 0;
+        let targetYPt = Number.isFinite(yPt) ? yPt : null;
+        if (!Number.isFinite(targetYPt) && Number.isFinite(yFromTopPt)) {
+            targetYPt = pageHeightPt - yFromTopPt;
+        }
+        if (!Number.isFinite(targetYPt)) {
+            targetYPt = pageHeightPt;
+        }
+        targetYPt = Math.max(0, Math.min(pageHeightPt, targetYPt));
+
         buildInternalAnchorCandidates(anchorId).forEach(candidate => {
             if (!candidate || existingDestinationNames.has(candidate)) return;
-            if (setPdfNamedDestination(basePdfDoc, baseDests, candidate, targetPage, 0, topY)) {
+            if (setPdfNamedDestination(basePdfDoc, baseDests, candidate, targetPage, targetXPt, targetYPt)) {
                 existingDestinationNames.add(candidate);
             }
         });
@@ -4673,7 +4744,7 @@ class WikiExporter {
         const footnoteAnchorMarkerPrefix = '__FOOTNOTE_ANCHOR_MARKER__';
         const footnoteAnchorMarkerSuffix = '__END__';
         let footnoteAnchorMarkerAssignments = [];
-        let footnoteInternalAnchorPages = new Map();
+        let footnoteInternalAnchorDestinations = new Map();
         if (finalFootnotePlans.length > 0) {
             const internalAnchorIds = collectFootnoteInternalAnchorIds(finalFootnotePlans);
             if (internalAnchorIds.length > 0) {
@@ -4770,7 +4841,7 @@ class WikiExporter {
         await this.page.pdf({ path: pdfPath, ...pdfOptionsFinal });
 
         if (Array.isArray(footnoteAnchorMarkerAssignments) && footnoteAnchorMarkerAssignments.length > 0) {
-            const { markerPages: footnoteAnchorMarkerPages } = await extractMarkerPagesFromPdf(
+            const { markerPositions: footnoteAnchorMarkerPositions } = await extractMarkerPositionsFromPdf(
                 pdfPath,
                 footnoteAnchorMarkerPrefix,
                 footnoteAnchorMarkerSuffix
@@ -4779,9 +4850,9 @@ class WikiExporter {
                 if (!item || typeof item.id !== 'string') return;
                 const markerIndex = Number(item.index);
                 if (!Number.isFinite(markerIndex)) return;
-                const pageNumber = footnoteAnchorMarkerPages.get(markerIndex);
-                if (!Number.isFinite(pageNumber) || pageNumber <= 0) return;
-                footnoteInternalAnchorPages.set(item.id, pageNumber);
+                const markerPosition = footnoteAnchorMarkerPositions.get(markerIndex);
+                if (!markerPosition || !Number.isFinite(markerPosition.page) || markerPosition.page <= 0) return;
+                footnoteInternalAnchorDestinations.set(item.id, markerPosition);
             });
         }
 
@@ -4804,7 +4875,7 @@ class WikiExporter {
                 itemGapMm: ptToMm(footnoteItemGapPt),
                 topPaddingMm: ptToMm(footnoteTopPaddingPt),
                 bottomPaddingMm: ptToMm(footnoteBottomPaddingPt),
-                internalAnchorPages: footnoteInternalAnchorPages
+                internalAnchorDestinations: footnoteInternalAnchorDestinations
             });
         }
 
