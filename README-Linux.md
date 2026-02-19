@@ -104,11 +104,6 @@ Force full rebuild of all pages (interactive confirmation):
 node export-all.js --base "https://your-wiki.example.com" --apikey "YOUR_WIKIJS_API_KEY" --output "/srv/wiki-pdf" --force-reupload
 ```
 
-Force full rebuild for cron/CI (non-interactive confirmation):
-```bash
-node export-all.js --base "https://your-wiki.example.com" --apikey "YOUR_WIKIJS_API_KEY" --output "/srv/wiki-pdf" --force-reupload --yes
-```
-
 The `export-all.js` command:
 - fetches page list from Wiki.js GraphQL API;
 - stores PDFs in the same folder hierarchy as wiki paths;

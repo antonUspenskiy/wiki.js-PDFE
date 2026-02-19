@@ -51,11 +51,6 @@ const argv = yargs(hideBin(process.argv))
         description: 'Force re-export of all discovered pages, ignoring incremental freshness checks',
         default: false
     })
-    .option('yes', {
-        type: 'boolean',
-        description: 'Confirm force-reupload for non-interactive runs',
-        default: false
-    })
     .help()
     .argv;
 
@@ -540,7 +535,6 @@ function loadRuntimeConfig() {
     if (typeof argv.footnoteFontSize === 'number') merged.footnoteFontSize = argv.footnoteFontSize;
     merged.dryRun = Boolean(argv.dryRun);
     merged.forceReupload = Boolean(argv.forceReupload);
-    merged.confirmForceReupload = Boolean(argv.yes);
 
     if (!merged.baseUrl) throw new Error('Missing base URL. Use --base or config.baseUrl');
     if (!merged.apiKey) throw new Error('Missing API key. Use --apikey or config.apiKey');
@@ -559,13 +553,8 @@ function loadRuntimeConfig() {
 async function confirmForceReupload(config) {
     if (!config.forceReupload) return;
 
-    if (config.confirmForceReupload) {
-        log('WARN', 'Force reupload confirmed via --yes. All discovered pages will be rebuilt.');
-        return;
-    }
-
     if (!process.stdin.isTTY || !process.stdout.isTTY) {
-        throw new Error('Force reupload requires confirmation. Re-run with --force-reupload --yes for non-interactive mode.');
+        throw new Error('Force reupload requires interactive confirmation. Run in TTY and type "reupload" to continue.');
     }
 
     log('WARN', 'Force reupload mode requested. All discovered pages will be rebuilt.');
