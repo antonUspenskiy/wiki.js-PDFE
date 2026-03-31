@@ -2358,6 +2358,8 @@ class WikiExporter {
                 });
             }
 
+            document.querySelectorAll('.link-wrap').forEach(node => node.remove());
+
             // Remove footer / branding blocks such as "Powered by Wiki.js"
             const footerCandidates = document.querySelectorAll('footer, .footer, .app-footer, .v-footer, .site-footer, .page-footer, .wiki-footer');
             footerCandidates.forEach(el => {
