@@ -54,6 +54,8 @@ const argv = yargs(hideBin(process.argv))
     .help()
     .argv;
 
+const MANAGED_META_SUFFIX = '.pdf.meta.json';
+
 function log(level, message) {
     const stamp = new Date().toISOString();
     console.log(`[${stamp}] [${level}] ${message}`);
@@ -151,6 +153,124 @@ function ensureDirectory(dirPath) {
 function parsePositiveNumber(value) {
     const parsed = Number(value);
     return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+function normalizePageId(value) {
+    if (value === null || value === undefined) return null;
+    const normalized = String(value).trim();
+    return normalized || null;
+}
+
+function normalizeFsPath(filePath) {
+    const resolved = path.resolve(filePath);
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function isPathInsideDirectory(rootDir, targetPath) {
+    const relative = path.relative(path.resolve(rootDir), path.resolve(targetPath));
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function collectManagedMetaFiles(rootDir) {
+    const metaFiles = [];
+
+    const walk = (currentDir) => {
+        let entries = [];
+        try {
+            entries = fs.readdirSync(currentDir, { withFileTypes: true });
+        } catch (_) {
+            return;
+        }
+
+        entries.forEach(entry => {
+            const absolutePath = path.join(currentDir, entry.name);
+            if (entry.isDirectory()) {
+                walk(absolutePath);
+                return;
+            }
+            if (entry.isFile() && entry.name.endsWith(MANAGED_META_SUFFIX)) {
+                metaFiles.push(absolutePath);
+            }
+        });
+    };
+
+    if (fs.existsSync(rootDir)) {
+        walk(rootDir);
+    }
+
+    return metaFiles.sort((a, b) => a.localeCompare(b));
+}
+
+function planManagedOutputPrune(outputDir, currentPagesById, currentPagesByPath) {
+    return collectManagedMetaFiles(outputDir)
+        .map(metaPath => {
+            const meta = readJsonSafe(metaPath);
+            if (!meta || typeof meta !== 'object') return null;
+
+            const pdfPath = metaPath.slice(0, -'.meta.json'.length);
+            const pdfPathKey = normalizeFsPath(pdfPath);
+            const metaPageId = normalizePageId(meta.pageId);
+            const metaPagePath = typeof meta.pagePath === 'string'
+                ? normalizeWikiPath(meta.pagePath)
+                : null;
+
+            if (metaPageId) {
+                const currentPage = currentPagesById.get(metaPageId);
+                if (!currentPage) {
+                    return { pdfPath, metaPath, reason: 'page_deleted' };
+                }
+
+                const expectedPdfPath = path.join(outputDir, buildRelativePdfPath(currentPage.path));
+                if (normalizeFsPath(expectedPdfPath) !== pdfPathKey) {
+                    return {
+                        pdfPath,
+                        metaPath,
+                        reason: 'page_moved',
+                        replacementPdfPath: expectedPdfPath
+                    };
+                }
+
+                return null;
+            }
+
+            if (metaPagePath && !currentPagesByPath.has(metaPagePath)) {
+                return { pdfPath, metaPath, reason: 'page_missing_by_path' };
+            }
+
+            return null;
+        })
+        .filter(Boolean);
+}
+
+function removeFileIfExists(filePath) {
+    if (!fs.existsSync(filePath)) return false;
+    fs.unlinkSync(filePath);
+    return true;
+}
+
+function pruneEmptyParentDirectories(rootDir, startDir) {
+    const removed = [];
+    const rootKey = normalizeFsPath(rootDir);
+    let currentDir = path.resolve(startDir);
+
+    while (normalizeFsPath(currentDir) !== rootKey && isPathInsideDirectory(rootDir, currentDir)) {
+        let entries = [];
+        try {
+            entries = fs.readdirSync(currentDir);
+        } catch (_) {
+            break;
+        }
+
+        if (entries.length > 0) {
+            break;
+        }
+
+        fs.rmdirSync(currentDir);
+        removed.push(currentDir);
+        currentDir = path.dirname(currentDir);
+    }
+
+    return removed;
 }
 
 function maskApiKey(apiKey) {
@@ -364,7 +484,7 @@ async function fetchWikiPages(baseUrl, apiKey, timeoutMs) {
 
 function buildMetaRecord(page, pageUrl, sourceUpdatedAt, generatedAt) {
     return {
-        pageId: page.id || null,
+        pageId: normalizePageId(page.id),
         pagePath: page.path,
         pageTitle: page.title || null,
         pageLocale: page.locale || null,
@@ -376,6 +496,9 @@ function buildMetaRecord(page, pageUrl, sourceUpdatedAt, generatedAt) {
 
 function evaluateSyncState(page, pdfPath, metaPath, forceReupload = false) {
     const sourceUpdatedAt = normalizeTimestamp(page.updatedAt);
+    const currentPageId = normalizePageId(page.id);
+    const currentPagePath = normalizeWikiPath(page.path);
+    const meta = readJsonSafe(metaPath);
 
     if (!fs.existsSync(pdfPath)) {
         return {
@@ -395,7 +518,25 @@ function evaluateSyncState(page, pdfPath, metaPath, forceReupload = false) {
         };
     }
 
-    const meta = readJsonSafe(metaPath);
+    if (meta && typeof meta === 'object') {
+        const metaPageId = normalizePageId(meta.pageId);
+        const metaPagePath = typeof meta.pagePath === 'string'
+            ? normalizeWikiPath(meta.pagePath)
+            : null;
+
+        if (
+            (metaPageId && currentPageId && metaPageId !== currentPageId) ||
+            (metaPagePath && metaPagePath !== currentPagePath)
+        ) {
+            return {
+                shouldExport: true,
+                action: 'update',
+                reason: 'meta_page_identity_mismatch',
+                sourceUpdatedAt
+            };
+        }
+    }
+
     if (meta && typeof meta.sourceUpdatedAt === 'string' && sourceUpdatedAt) {
         const metaUpdatedAt = normalizeTimestamp(meta.sourceUpdatedAt);
         if (metaUpdatedAt && metaUpdatedAt === sourceUpdatedAt) {
@@ -582,14 +723,29 @@ async function main() {
         log('WARN', 'Force reupload mode is enabled. Incremental checks are bypassed for existing PDFs.');
     }
 
-    const pages = await fetchWikiPages(config.baseUrl, config.apiKey, config.timeout);
+    const pages = (await fetchWikiPages(config.baseUrl, config.apiKey, config.timeout))
+        .map(page => ({
+            ...page,
+            id: normalizePageId(page.id),
+            path: normalizeWikiPath(page.path)
+        }));
     log('INFO', `Pages discovered: ${pages.length}`);
+
+    const currentPagesById = new Map();
+    const currentPagesByPath = new Map();
+    pages.forEach(page => {
+        if (page.id) {
+            currentPagesById.set(page.id, page);
+        }
+        currentPagesByPath.set(page.path, page);
+    });
 
     const stats = {
         total: pages.length,
         skipped: 0,
         created: 0,
         updated: 0,
+        deleted: 0,
         failed: 0
     };
 
@@ -664,7 +820,43 @@ async function main() {
         log('OK', `${itemLabel} completed in ${(elapsedMs / 1000).toFixed(1)}s`);
     }
 
-    log('INFO', `Summary: total=${stats.total}, created=${stats.created}, updated=${stats.updated}, skipped=${stats.skipped}, failed=${stats.failed}`);
+    if (!config.dryRun && stats.failed > 0) {
+        log('WARN', 'Skipping orphan cleanup because one or more page exports failed in this run.');
+    } else {
+        const prunePlan = planManagedOutputPrune(config.outputDir, currentPagesById, currentPagesByPath);
+
+        for (const entry of prunePlan) {
+            const relativePdfPath = path.relative(config.outputDir, entry.pdfPath) || path.basename(entry.pdfPath);
+            const reason = entry.reason === 'page_moved' && entry.replacementPdfPath
+                ? `${entry.reason} -> ${path.relative(config.outputDir, entry.replacementPdfPath)}`
+                : entry.reason;
+
+            log('DELETE', `${relativePdfPath} (${reason})`);
+
+            if (config.dryRun) {
+                stats.deleted += 1;
+                continue;
+            }
+
+            try {
+                const removedPdf = removeFileIfExists(entry.pdfPath);
+                const removedMeta = removeFileIfExists(entry.metaPath);
+
+                if (!removedPdf && !removedMeta) {
+                    log('WARN', `${relativePdfPath} prune target already missing.`);
+                    continue;
+                }
+
+                pruneEmptyParentDirectories(config.outputDir, path.dirname(entry.metaPath));
+                stats.deleted += 1;
+            } catch (error) {
+                stats.failed += 1;
+                log('ERROR', `${relativePdfPath} prune failed: ${error.message}`);
+            }
+        }
+    }
+
+    log('INFO', `Summary: total=${stats.total}, created=${stats.created}, updated=${stats.updated}, deleted=${stats.deleted}, skipped=${stats.skipped}, failed=${stats.failed}`);
     if (stats.failed > 0) {
         process.exitCode = 1;
     }

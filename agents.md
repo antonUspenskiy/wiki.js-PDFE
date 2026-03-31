@@ -12,8 +12,14 @@
 - `pageUrl` из `config.json` не должен перезаписывать `--base`/`--article` в массовом экспорте.
 - Массовый экспорт должен быть инкрементальным: генерировать отсутствующие PDF и пересобирать только устаревшие.
 - Актуальность проверяется по `updatedAt` страницы wiki.js и локальному `*.pdf.meta.json` (с fallback на `mtime` файла).
+- Если локальный `*.pdf.meta.json` указывает на другую страницу (`pageId`/`pagePath` не совпадают с текущей страницей для этого output-path), `export-all.js` обязан делать `update`, а не `skip`.
 - Структура директорий в `output` должна зеркалировать пути страниц wiki.js.
-- Логи должны явно отражать действия: `create`, `update`, `skip`, `error`, и итоговую сводку.
+- После основного прохода `export-all.js` должен выполнять безопасную prune-фазу для ранее сгенерированных PDF: удалять orphan-файлы страниц, которые были удалены в wiki.js или перемещены на другой path.
+- Prune-фаза работает только по managed-файлам экспортера, то есть по записям с локальным `*.pdf.meta.json`; сторонние PDF без sidecar-meta удалять нельзя.
+- При перемещении страницы старый PDF по прежнему пути считается orphan и должен удаляться, а новый путь должен пересобираться/актуализироваться отдельно в рамках того же общего sync-процесса.
+- Если в текущем run есть хотя бы одна ошибка экспорта страницы, prune-фазу удаления orphan PDF выполнять нельзя, чтобы не удалять старые артефакты до успешной сборки замены.
+- Очистка пустых директорий после удаления orphan PDF допускается только внутри `output` и только если директория реально пуста в момент удаления; директории, где остались другие PDF, meta-файлы, подкаталоги или любые иные файлы, трогать нельзя.
+- Логи должны явно отражать действия: `create`, `update`, `skip`, `delete`, `error`, и итоговую сводку.
 
 Целевой сценарий эксплуатации — Linux + cron (`--base`, `--apikey`, `--output`).
 
@@ -60,6 +66,7 @@
 - If blocked-link text contains domain-like tokens (for example, `site.tv`), they must not be auto-linked by PDF viewers.
 - All other links must remain clickable.
 - TOC links must remain clickable and keep a link color (default `#0066cc`, or a valid non-neutral theme link color).
+- Служебные site-only блоки `.link-wrap` (например, кнопка-ссылка на PDF, оставляемая на странице сайта) не должны попадать в PDF и должны удаляться из export DOM до рендера.
 - Link-processing behavior is part of shared PDF logic in `Export.js` and must stay identical for single-page and batch export (via `export-all.js` calling `Export.js`).
 
 ## Инцидент 2026-02-18: рассинхрон футнотов и TOC на локальном Windows
